@@ -1,0 +1,996 @@
+openapi: 3.0.3
+info:
+  title: If-Vest API
+  version: 0.2.0
+  description: |
+    Backend API for If-Vest. See `docs/conventions.md` for global rules
+    (naming, errors, dates, money, auth, CORS, rate limits, AI guardrails).
+
+    All endpoints return JSON. Authenticated endpoints require
+    `Authorization: Bearer <Supabase JWT>`.
+
+servers:
+  - url: http://localhost:8000
+    description: Local dev (FastAPI default)
+  - url: https://kdd-ai-project-be.onrender.com
+    description: Render deploy (TBD - exact URL depends on Render service name)
+
+tags:
+  - name: tickers
+    description: Ticker validation and search
+  - name: market
+    description: Market data passthrough (yfinance)
+  - name: calculate
+    description: Opportunity-cost computation (F-01, F-02)
+  - name: decisions
+    description: User decision records (F-04 source data)
+  - name: patterns
+    description: Aggregated pattern analysis (F-04, F-06)
+  - name: ai
+    description: LLM-backed endpoints (F-05, F-06)
+  - name: ops
+    description: Health, admin, demo seeding
+
+security: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Supabase JWT issued by Auth.
+    adminToken:
+      type: apiKey
+      in: header
+      name: X-Admin-Token
+      description: Shared secret from `ADMIN_TOKEN` env. Used by admin/seed endpoints only.
+
+  schemas:
+    # ---------- Shared / primitives ----------
+    Ticker:
+      type: string
+      pattern: "^[A-Z][A-Z0-9.-]{0,9}$"
+      example: NVDA
+      description: Uppercase US stock ticker. 1-10 chars, must start with a letter.
+
+    DateOnly:
+      type: string
+      format: date
+      example: "2025-03-15"
+
+    Direction:
+      type: string
+      enum:
+        - missed_gain
+        - avoided_loss
+        - kept_gain
+        - endured_loss
+        - cut_short_gain
+        - well_timed_exit
+        - neutral
+      description: |
+        Outcome of the user's (non-)decision, derived from `scenario_type` + sign of price move.
+
+        | scenario_type | price up | price down |
+        |---|---|---|
+        | `no_buy` | `missed_gain` | `avoided_loss` |
+        | `no_sell` | `kept_gain` | `endured_loss` |
+        | `sold_too_early` | `cut_short_gain` | `well_timed_exit` |
+
+        `neutral` whenever |diff_percent| < 0.5%.
+
+    Outcome:
+      type: string
+      enum: [favorable, unfavorable, neutral]
+      description: |
+        Convenience derived from Direction. Frontend uses this for color/copy bucket.
+        - `favorable`: avoided_loss | kept_gain | well_timed_exit
+        - `unfavorable`: missed_gain | endured_loss | cut_short_gain
+        - `neutral`: neutral
+
+    ScenarioType:
+      type: string
+      enum: [no_buy, no_sell, sold_too_early]
+      description: |
+        - `no_buy`: User considered buying but didn't.
+        - `no_sell`: User considered selling but didn't.
+        - `sold_too_early`: User sold and price kept rising.
+
+    # ---------- Errors ----------
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: TICKER_NOT_FOUND
+            message:
+              type: string
+              example: "Ticker 'ABCXYZ' could not be found."
+            details:
+              type: array
+              nullable: true
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+
+    # ---------- Tickers ----------
+    TickerValidation:
+      type: object
+      required: [ticker, valid]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        valid: { type: boolean }
+        name:
+          type: string
+          nullable: true
+          example: "NVIDIA Corporation"
+        exchange:
+          type: string
+          nullable: true
+          example: "NASDAQ"
+        currency:
+          type: string
+          nullable: true
+          example: "USD"
+
+    TickerSearchItem:
+      type: object
+      required: [ticker, name]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        name:
+          type: string
+          example: "Apple Inc."
+        exchange:
+          type: string
+          nullable: true
+          example: "NASDAQ"
+
+    TickerSearchResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/TickerSearchItem" }
+
+    # ---------- F-01 calculate ----------
+    CalculateRequest:
+      type: object
+      required: [ticker, scenario_type, decision_date]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        scenario_type: { $ref: "#/components/schemas/ScenarioType" }
+        decision_date: { $ref: "#/components/schemas/DateOnly" }
+        quantity:
+          type: number
+          minimum: 0.0001
+          description: Shares. XOR with `amount`.
+        amount:
+          type: number
+          minimum: 0.01
+          description: USD amount. XOR with `quantity`.
+      oneOf:
+        - required: [quantity]
+          not: { required: [amount] }
+        - required: [amount]
+          not: { required: [quantity] }
+
+    CalculateResponse:
+      type: object
+      required:
+        - ticker
+        - scenario_type
+        - decision_date
+        - actual_date_used
+        - decision_price
+        - current_price
+        - current_date
+        - diff_amount
+        - diff_percent
+        - direction
+        - outcome
+        - was_decision_correct
+        - split_adjusted
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        scenario_type: { $ref: "#/components/schemas/ScenarioType" }
+        decision_date:
+          allOf: [{ $ref: "#/components/schemas/DateOnly" }]
+          description: The date the user supplied.
+        actual_date_used:
+          allOf: [{ $ref: "#/components/schemas/DateOnly" }]
+          description: |
+            Trading day actually used for `decision_price`. Differs from
+            `decision_date` only when that date was a market holiday or weekend
+            (in which case we use the most recent prior trading day).
+        decision_price:
+          type: number
+          description: Adjusted close on `actual_date_used`.
+          example: 118.50
+        current_price:
+          type: number
+          example: 142.30
+          description: Adjusted close as of `current_date`. Always last close, never intraday.
+        current_date:
+          allOf: [{ $ref: "#/components/schemas/DateOnly" }]
+          description: |
+            The date of the most recent close used as "current". Always a trading day.
+            Never today's intraday price.
+        diff_amount:
+          type: number
+          description: |
+            (current_price - decision_price) * quantity, OR
+            amount * (current_price / decision_price - 1) if amount-based.
+            Sign is always relative to the price move (positive when price went up).
+          example: 238.00
+        diff_percent:
+          type: number
+          description: ((current_price - decision_price) / decision_price) * 100. Sign reflects price move.
+          example: 20.08
+        direction: { $ref: "#/components/schemas/Direction" }
+        outcome: { $ref: "#/components/schemas/Outcome" }
+        was_decision_correct:
+          type: boolean
+          nullable: true
+          description: |
+            Convenience: `outcome == "favorable"` => true, `unfavorable` => false,
+            `neutral` => null.
+        split_adjusted:
+          type: boolean
+          description: Always true since we use yfinance adjusted close.
+
+    # ---------- F-02 optimal-timing ----------
+    OptimalTimingRequest:
+      type: object
+      required: [ticker, start_date, end_date]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        start_date: { $ref: "#/components/schemas/DateOnly" }
+        end_date: { $ref: "#/components/schemas/DateOnly" }
+
+    OptimalPoint:
+      type: object
+      required: [date, price]
+      properties:
+        date: { $ref: "#/components/schemas/DateOnly" }
+        price: { type: number }
+
+    OptimalTimingResponse:
+      type: object
+      required: [ticker, best_buy, best_sell]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        best_buy: { $ref: "#/components/schemas/OptimalPoint" }
+        best_sell: { $ref: "#/components/schemas/OptimalPoint" }
+        max_swing_percent:
+          type: number
+          nullable: true
+          description: |
+            ((best_sell.price - best_buy.price) / best_buy.price) * 100,
+            only when best_buy.date < best_sell.date. null otherwise.
+
+    # ---------- F-03 price-history ----------
+    PriceHistoryItem:
+      type: object
+      required: [date, open, high, low, close]
+      properties:
+        date: { $ref: "#/components/schemas/DateOnly" }
+        open: { type: number }
+        high: { type: number }
+        low: { type: number }
+        close: { type: number }
+        volume:
+          type: integer
+          nullable: true
+
+    PriceHistoryResponse:
+      type: object
+      required: [ticker, items]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/PriceHistoryItem" }
+
+    # ---------- Decisions ----------
+    DecisionInput:
+      type: object
+      required: [ticker, scenario_type, decision_date]
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        scenario_type: { $ref: "#/components/schemas/ScenarioType" }
+        decision_date: { $ref: "#/components/schemas/DateOnly" }
+        end_date:
+          allOf: [{ $ref: "#/components/schemas/DateOnly" }]
+          nullable: true
+        quantity:
+          type: number
+          minimum: 0.0001
+        amount:
+          type: number
+          minimum: 0.01
+        notes:
+          type: string
+          maxLength: 500
+          nullable: true
+      oneOf:
+        - required: [quantity]
+          not: { required: [amount] }
+        - required: [amount]
+          not: { required: [quantity] }
+
+    Decision:
+      type: object
+      required:
+        - id
+        - user_id
+        - ticker
+        - scenario_type
+        - decision_date
+        - actual_date_used
+        - decision_price_snapshot
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        scenario_type: { $ref: "#/components/schemas/ScenarioType" }
+        decision_date: { $ref: "#/components/schemas/DateOnly" }
+        actual_date_used:
+          allOf: [{ $ref: "#/components/schemas/DateOnly" }]
+          description: |
+            Trading day frozen at insert time. Used as the source-of-truth date for
+            all subsequent computations on this decision.
+        end_date:
+          allOf: [{ $ref: "#/components/schemas/DateOnly" }]
+          nullable: true
+        quantity:
+          type: number
+          nullable: true
+        amount:
+          type: number
+          nullable: true
+        decision_price_snapshot:
+          type: number
+          description: |
+            Adjusted close on `actual_date_used` at the moment of insert. Frozen.
+            Re-computation uses fresh fetch (handles splits) but this snapshot is
+            kept for audit / display ("the price when you logged this").
+        notes:
+          type: string
+          nullable: true
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      oneOf:
+        - required: [quantity]
+          not: { required: [amount] }
+        - required: [amount]
+          not: { required: [quantity] }
+
+    DecisionWithCurrent:
+      allOf:
+        - $ref: "#/components/schemas/Decision"
+        - type: object
+          required: [current]
+          properties:
+            current:
+              $ref: "#/components/schemas/CalculateResponse"
+
+    DecisionListResponse:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Decision" }
+        total:
+          type: integer
+          description: Total count for the user (cap is 50, so always cheap to compute).
+
+    # ---------- Patterns (F-04, F-06) ----------
+    RegrettedDecision:
+      allOf:
+        - $ref: "#/components/schemas/Decision"
+        - type: object
+          required: [current, regret_score]
+          properties:
+            current: { $ref: "#/components/schemas/CalculateResponse" }
+            regret_score:
+              type: number
+              description: |
+                |diff_percent| of `current`. Higher = more regretted.
+                Ranking metric for `most_regretted_top3`.
+
+    PatternMetrics:
+      type: object
+      required:
+        - avg_distance_from_peak_percent
+        - consistency_score
+        - scenario_distribution
+        - most_regretted_top3
+      properties:
+        avg_distance_from_peak_percent:
+          type: number
+          description: |
+            For each decision, compute the max adjusted close in
+            (actual_date_used, current_date]. Distance = ((decision_price - peak) / peak) * 100.
+            This is always negative (or zero). Reported value is the mean across all decisions.
+            Example: -18.4 means the user typically decides 18.4% below the subsequent peak.
+        consistency_score:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: |
+            Variability of decisions, normalized to [0, 1] (higher = more consistent).
+            Formula (v0.2): `1 - min(stddev(distances) / 30, 1)`, where `distances` is
+            the per-decision distance-from-peak-percent series, and `30` is the
+            "fully inconsistent" threshold.
+            **Threshold (30) is preliminary; will be retuned with seed data before
+            week 4. Do not depend on exact values.**
+        scenario_distribution:
+          type: object
+          additionalProperties: { type: integer }
+          description: Count of decisions per scenario_type.
+          example:
+            no_buy: 7
+            no_sell: 5
+            sold_too_early: 2
+        most_regretted_top3:
+          type: array
+          maxItems: 3
+          description: |
+            Top 3 decisions by regret_score (= |current.diff_percent|). Each item
+            includes the full decision plus a freshly computed `current` calculation
+            (no extra round-trip for the frontend).
+          items: { $ref: "#/components/schemas/RegrettedDecision" }
+
+    PatternsLocked:
+      type: object
+      required: [unlocked, current_count, required_count]
+      properties:
+        unlocked: { type: boolean, enum: [false] }
+        current_count: { type: integer, minimum: 0 }
+        required_count: { type: integer, example: 10 }
+
+    PatternsUnlocked:
+      type: object
+      required: [unlocked, decision_count, metrics]
+      properties:
+        unlocked: { type: boolean, enum: [true] }
+        decision_count: { type: integer }
+        metrics: { $ref: "#/components/schemas/PatternMetrics" }
+
+    PatternsResponse:
+      oneOf:
+        - $ref: "#/components/schemas/PatternsLocked"
+        - $ref: "#/components/schemas/PatternsUnlocked"
+      discriminator:
+        propertyName: unlocked
+
+    InsightsLocked:
+      type: object
+      required: [unlocked]
+      properties:
+        unlocked: { type: boolean, enum: [false] }
+
+    InsightsUnlocked:
+      type: object
+      required: [unlocked, insights, generated_at]
+      properties:
+        unlocked: { type: boolean, enum: [true] }
+        insights:
+          type: array
+          items: { type: string }
+          description: |
+            Each item is a single sentence describing a pattern. Generated by F-06 LLM.
+            Post-processed for guardrail compliance.
+        generated_at: { type: string, format: date-time }
+        cached:
+          type: boolean
+          description: |
+            True if returned from cache (decisions table unchanged since `generated_at`).
+            False if the LLM was invoked on this request.
+        degraded:
+          type: boolean
+          description: |
+            True when guardrail post-processing failed 3 times and we returned a fallback.
+            Frontend should hide LLM commentary and show only F-04 stats.
+
+    InsightsResponse:
+      oneOf:
+        - $ref: "#/components/schemas/InsightsLocked"
+        - $ref: "#/components/schemas/InsightsUnlocked"
+      discriminator:
+        propertyName: unlocked
+
+    # ---------- F-05 parse-decision (AI) ----------
+    ParseDecisionRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 3
+          maxLength: 1000
+          example: "Late March, was thinking about buying 10 shares of Nvidia but didn't"
+
+    ParseDecisionResponse:
+      type: object
+      required: [extracted, confidence, ticker_validated]
+      properties:
+        extracted:
+          type: object
+          properties:
+            ticker:
+              allOf: [{ $ref: "#/components/schemas/Ticker" }]
+              nullable: true
+            scenario_type:
+              allOf: [{ $ref: "#/components/schemas/ScenarioType" }]
+              nullable: true
+            decision_date:
+              allOf: [{ $ref: "#/components/schemas/DateOnly" }]
+              nullable: true
+            quantity:
+              type: number
+              nullable: true
+            amount:
+              type: number
+              nullable: true
+        confidence:
+          type: object
+          description: Per-field confidence (0-1). Frontend should clear fields below 0.7.
+          properties:
+            ticker: { type: number, minimum: 0, maximum: 1 }
+            scenario_type: { type: number, minimum: 0, maximum: 1 }
+            decision_date: { type: number, minimum: 0, maximum: 1 }
+            quantity: { type: number, minimum: 0, maximum: 1 }
+            amount: { type: number, minimum: 0, maximum: 1 }
+        ticker_validated:
+          type: boolean
+          description: Whether the extracted ticker passed `/tickers/validate`.
+
+    # ---------- Ops ----------
+    HealthResponse:
+      type: object
+      required: [status, version]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+          example: "0.2.0"
+        db:
+          type: string
+          enum: [ok, degraded]
+        yfinance:
+          type: string
+          enum: [ok, degraded]
+
+    SeedDemoRequest:
+      type: object
+      required: [user_id]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: Target user. Decisions will be inserted under this user_id.
+        count:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 50
+        clear_existing:
+          type: boolean
+          default: false
+          description: |
+            If true, delete existing decisions for the user first.
+            Used when re-seeding the demo account between dry runs.
+
+    SeedDemoResponse:
+      type: object
+      required: [decisions_created]
+      properties:
+        decisions_created: { type: integer }
+        user_id: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Authenticated but not authorized
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: Business-rule conflict
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: Request body or query failed validation
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds until next attempt allowed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    UpstreamError:
+      description: Yahoo Finance or LLM provider down
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+paths:
+  # ========== Tickers ==========
+  /tickers/validate:
+    get:
+      tags: [tickers]
+      summary: Validate a ticker symbol
+      description: |
+        Returns whether the ticker exists on Yahoo Finance. Public endpoint.
+        Used by client form on every input change (debounced).
+      parameters:
+        - name: ticker
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/Ticker" }
+      responses:
+        "200":
+          description: |
+            Validation result. Note: invalid tickers return 200 with `valid: false`,
+            not 404. This makes client debouncing simpler.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TickerValidation" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  /tickers/search:
+    get:
+      tags: [tickers]
+      summary: Autocomplete ticker by name or symbol prefix
+      description: |
+        Used by the input form for autocomplete. Public endpoint.
+        Backend can use yfinance's quote search or a static SP500 file as fallback.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 50
+            example: "appl"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 25
+            default: 10
+      responses:
+        "200":
+          description: Up to `limit` suggestions, ranked by relevance.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TickerSearchResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  # ========== Calculate (F-01) ==========
+  /calculate:
+    post:
+      tags: [calculate]
+      summary: Compute opportunity cost for a single decision
+      description: |
+        Pure compute. Does not persist. Public endpoint (used by Landing demo + signed-in flow).
+        Use `POST /decisions` to save the result.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CalculateRequest" }
+      responses:
+        "200":
+          description: Computed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CalculateResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  # ========== Optimal timing (F-02) ==========
+  /optimal-timing:
+    post:
+      tags: [calculate]
+      summary: Find best buy/sell points within a date range
+      description: |
+        Public endpoint. Scans the supplied window for min and max adjusted close.
+        Range cap: 5 years. Returns 422 with `RANGE_TOO_LARGE` if exceeded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OptimalTimingRequest" }
+      responses:
+        "200":
+          description: Optimal points
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OptimalTimingResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  # ========== Price history (F-03) ==========
+  /price-history:
+    get:
+      tags: [market]
+      summary: Daily OHLCV time series
+      description: |
+        Used by the F-03 chart. Public endpoint. Cap: 5 years per request.
+        Backend caches per (ticker, date) to keep yfinance load low.
+      parameters:
+        - name: ticker
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/Ticker" }
+        - name: start_date
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/DateOnly" }
+        - name: end_date
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/DateOnly" }
+      responses:
+        "200":
+          description: Daily OHLCV array
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PriceHistoryResponse" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  # ========== Decisions ==========
+  /decisions:
+    post:
+      tags: [decisions]
+      summary: Save a decision record
+      description: |
+        Computes `actual_date_used` and `decision_price_snapshot` from yfinance at
+        insert time and freezes them. Returns 409 with `DECISION_LIMIT_REACHED`
+        if the user already has 50 decisions. The frontend should offer an "oldest
+        first" delete dialog before retrying.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DecisionInput" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Decision" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+    get:
+      tags: [decisions]
+      summary: List the current user's decisions
+      description: |
+        Returns all of the user's decisions in one shot (50-item cap means
+        no pagination is needed for MVP). Default sort `-created_at`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: ticker
+          in: query
+          schema: { $ref: "#/components/schemas/Ticker" }
+        - name: scenario_type
+          in: query
+          schema: { $ref: "#/components/schemas/ScenarioType" }
+        - name: from
+          in: query
+          description: Inclusive lower bound on decision_date.
+          schema: { $ref: "#/components/schemas/DateOnly" }
+        - name: to
+          in: query
+          description: Inclusive upper bound on decision_date.
+          schema: { $ref: "#/components/schemas/DateOnly" }
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [created_at, -created_at, decision_date, -decision_date]
+            default: -created_at
+      responses:
+        "200":
+          description: Decision list (no pagination, max 50)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DecisionListResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /decisions/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [decisions]
+      summary: Get a single decision with current re-computed values
+      description: |
+        Fetches the stored Decision and re-computes the F-01 result against today's
+        most recent close. Use this for detail views.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Decision plus current calculation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DecisionWithCurrent" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+    delete:
+      tags: [decisions]
+      summary: Delete a decision
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Deleted
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ========== Patterns (F-04 + F-06) ==========
+  /patterns:
+    get:
+      tags: [patterns]
+      summary: F-04 pattern statistics
+      description: |
+        Returns locked shape (with progress) when user has < 10 decisions, unlocked otherwise.
+        See `PatternMetrics` for the formulas (especially `consistency_score`, which
+        uses a tunable threshold expected to be retuned before week 4).
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Locked or unlocked patterns
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PatternsResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /patterns/insights:
+    get:
+      tags: [patterns, ai]
+      summary: F-06 LLM-generated insights on top of F-04 stats
+      description: |
+        Lazy generation: if the user's decisions table has been mutated since the last
+        cache entry's `generated_at`, regenerate via LLM; otherwise return cache.
+        This keeps cost low and avoids regenerating on every POST /decisions.
+
+        Per-user rate limit: 5/day. Hitting the limit returns 429 with cached
+        insights (if any) or `{ unlocked: true, degraded: true }`.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Locked or unlocked insights
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InsightsResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  # ========== Parse decision (F-05, AI) ==========
+  /parse-decision:
+    post:
+      tags: [ai]
+      summary: F-05 natural-language to structured decision extraction
+      description: |
+        Per-user rate limit: 30/day.
+        Backend validates extracted ticker against `/tickers/validate` before returning.
+        Frontend should clear fields with confidence < 0.7 and let the user fill manually.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ParseDecisionRequest" }
+      responses:
+        "200":
+          description: Extracted fields with confidence
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ParseDecisionResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  # ========== Ops ==========
+  /health:
+    get:
+      tags: [ops]
+      summary: Health check
+      description: |
+        Used by Render for service checks and by an external cron (e.g. cron-job.org)
+        to keep free-tier instances warm before demos.
+        Returns 200 even when degraded; only 5xx if the process can't respond.
+      responses:
+        "200":
+          description: Service is up; subsystems may be degraded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+
+  /admin/seed-demo:
+    post:
+      tags: [ops]
+      summary: Seed a user account with demo decisions for presentation
+      description: |
+        Creates `count` decisions for the target user, drawn from a curated set of
+        scenarios + tickers designed to populate F-04/F-06 with realistic patterns
+        (so the demo account hits the 10-decision unlock threshold and shows
+        meaningful insights).
+
+        Auth: `X-Admin-Token` header. NOT exposed via Bearer JWT. Token comes from
+        `ADMIN_TOKEN` env var on the backend.
+
+        Use case: before a presentation, point this at a `demo@if-vest.com` account.
+      security:
+        - adminToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SeedDemoRequest" }
+      responses:
+        "201":
+          description: Decisions created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SeedDemoResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
