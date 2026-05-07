@@ -1,0 +1,18 @@
+# Render infrastructure-as-code.
+# When connected to this repo, Render reads this file on push and applies changes.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: kdd-ai-project-be
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Secrets are NOT defined here. Set them in the Render dashboard:
+      # SUPABASE_URL, SUPABASE_JWT_SECRET, SUPABASE_SERVICE_ROLE_KEY,
+      # ANTHROPIC_API_KEY, ADMIN_TOKEN
