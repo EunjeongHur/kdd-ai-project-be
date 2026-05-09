@@ -9,6 +9,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from routers.calculate import router as calculate_router
+
+
 APP_VERSION = "0.2.0"
 
 app = FastAPI(
@@ -32,6 +35,7 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Admin-Token"],
 )
 
+app.include_router(calculate_router)
 
 class HealthResponse(BaseModel):
     status: str
