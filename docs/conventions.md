@@ -100,13 +100,64 @@ No `limit` or `cursor` — we always return everything that matches.
 
 ## 8. Ticker validation flow
 
-`/tickers/validate` is the **only** authoritative source for "is this a real ticker". All other endpoints that take a ticker should call the validation logic internally and return `TICKER_NOT_FOUND` on miss.
+### Source of truth
 
-`/tickers/search` does autocomplete (input UX). It must NOT return tickers that would fail `/tickers/validate`. If yfinance search isn't reliable, fall back to a static SP500 list shipped with the backend.
+`/tickers/validate` is the **only** authoritative source for "is this a real ticker". All other endpoints that take a ticker should call the validation logic internally and return `TICKER_NOT_FOUND` (422) on miss.
+
+### Static index + yfinance hybrid
+
+The backend ships with `data/tickers_index.json` — a pre-built list of all NASDAQ + NYSE listings (~5000 entries: `{ticker, name, exchange}`). Generated once from NASDAQ Trader's public symbol directory, committed to the repo, refreshed manually when needed.
+
+**Lookup order** for both `/tickers/validate` and `/tickers/search`:
+
+1. **Static index first** (in-memory, sub-millisecond).
+2. **yfinance fallback** only when the static index doesn't cover the case:
+   - `validate`: ticker not in static index → check yfinance (handles new IPOs, symbols added since last refresh).
+   - `search`: static index returns < 3 results → augment with yfinance Search.
+
+### Filtering
+
+`/tickers/search` returns only `EQUITY` and `ETF` quote types. No mutual funds, currencies, futures, or crypto. The static index is pre-filtered to these types; yfinance results are filtered post-fetch.
+
+### Empty input
+
+`/tickers/search?q=` (empty) returns `200 { items: [] }`. NOT 422. The frontend often clears its input field; the backend handles that case so the client doesn't have to guard every call site.
+
+### Ranking
+
+Within `/tickers/search`:
+
+1. Ticker prefix match (highest)
+2. Name prefix match
+3. Name substring match (lowest)
+
+Within a tier: alphabetical by ticker. yfinance results, when augmenting, append after static results unless they offer a higher-tier match.
+
+### Upstream failures
+
+`/tickers/validate` can return 502 on yfinance failure (the caller needs to know the lookup didn't complete).
+
+`/tickers/search` must **never** return 502 — degrading to "fewer results from static index" or "empty list" is acceptable. Search is non-critical UX; a hard error blocks the input.
+
+### Caching
+
+In-memory TTL cache (no DB needed):
+
+| Endpoint | Key | TTL | Reason |
+|---|---|---|---|
+| `/tickers/validate` | normalized ticker | 24 hours | Existence rarely changes |
+| `/tickers/search` | `(q, limit)` | 1 hour | Names/exchanges rarely change |
+
+Use `cachetools.TTLCache` or equivalent. Reset on backend restart is fine.
+
+### Normalization
+
+Always uppercase + strip whitespace before pattern check or lookup. `?ticker= aapl ` → treated as `AAPL`. Spec's `Ticker` regex (`^[A-Z][A-Z0-9.-]{0,9}$`) is checked **after** normalization.
 
 ## 9. Caching
 
 - `GET /price-history` and `/calculate` may hit Yahoo Finance. Backend caches in `price_cache` table by `(ticker, date)`. Cache fresh for closed market days; refresh same-day for current trading day.
+- `GET /tickers/validate` and `/tickers/search` use in-memory TTL caches (see §8).
 - LLM responses (F-06 patterns/insights) cached per-user in an `insights_cache` table. Invalidated lazily: on `GET /patterns/insights`, compare cache `generated_at` vs the user's `decisions.updated_at` MAX. If decisions are newer, regenerate.
 - Public endpoints set `Cache-Control: public, max-age=300` for non-current dates; `no-store` for current trading day.
 
