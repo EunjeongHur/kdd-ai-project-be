@@ -47,9 +47,9 @@ class ParseDecisionResponse(BaseModel):
     ticker_validated: bool = Field(
         ...,
         description=(
-            "Whether the extracted ticker passed validation. Currently a format "
-            "check only (1-10 chars, starts with letter). Once /tickers/validate "
-            "ships, this will reflect actual existence."
+            "Whether the extracted ticker exists. Runs format check -> static "
+            "NASDAQ index -> yfinance fallback via services.ticker_service. "
+            "False when ticker is null, malformed, or not found."
         ),
     )
     reasoning: str = Field(

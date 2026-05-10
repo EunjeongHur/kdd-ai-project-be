@@ -185,9 +185,14 @@ Allow only:
 
 Methods: `GET, POST, DELETE, OPTIONS`. Headers: `Authorization, Content-Type, X-Admin-Token`. No wildcard origins.
 
-## 12. AI guardrails (applies to F-05, F-06)
+## 12. AI guardrails (applies to F-05, F-06, /reflect)
 
-- **Output post-processing**: Reject any response containing forbidden phrases (`buy`, `sell`, `recommend`, `will rise`, `will fall`, `should`). Regenerate up to 3 times. After 3 failures, return only the F-04 numeric stats with `degraded: true`.
+- **Output post-processing**: Reject responses containing recommendation or prediction patterns. Regenerate up to 3 times. After 3 failures, return numeric stats only with `degraded: true`. Specific patterns to reject:
+  - Prescriptive: `should`, `shouldn't`, `must`, `need to`, `ought to`, `next time`, `going forward`
+  - Recommendations: `recommend`, `I'd suggest`, `my advice`, `time to buy/sell`, `consider buying/selling`, `opportunity to buy/sell`
+  - Future predictions: `will rise/fall/drop/...`, `likely to rise/...`, `going to rise/...`
+  - Strategy: `diversify`, `hold longer`, `rebalance`, `take profits`, `stop-loss`
+- Note: bare `buy` / `sell` / `held` are NOT forbidden — they're necessary to describe the scenario factually (`"you opted not to buy"`, `"you sold X"`). The line is between **describing the past** (allowed) and **prescribing future action** (forbidden).
 - **Structured output**: Both endpoints use JSON Schema mode. No free-form text in `extracted` or `insights` fields beyond what the schema allows.
 - **Token logging**: Every LLM call logs `{ user_id, endpoint, model, input_tokens, output_tokens, duration_ms }` for cost monitoring.
 - **Provider-agnostic**: Backend abstracts behind an `LLMProvider` interface. F-05 uses cheap/fast model (Claude Haiku / GPT-4o-mini); F-06 uses stronger model (Claude Sonnet / GPT-4o).
