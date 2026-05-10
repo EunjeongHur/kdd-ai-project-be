@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from routers.calculate import router as calculate_router
 from routers.parse_decision import router as parse_decision_router
+from routers.reflect import router as reflect_router
 from routers.tickers import router as tickers_router
 
 
@@ -88,6 +89,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 app.include_router(calculate_router)
 app.include_router(parse_decision_router)
+app.include_router(reflect_router)
 app.include_router(tickers_router)
 
 class HealthResponse(BaseModel):

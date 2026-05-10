@@ -24,10 +24,15 @@ from schemas.parse_decision import (
     ExtractedFields,
     ParseDecisionResponse,
 )
+from schemas.reflect import ReflectRequest, ReflectResponse
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-haiku-4-5"
+# Different models per task. Extraction is bounded structured output that
+# Haiku does very well; reflection is creative writing where Sonnet's
+# instruction following + tone calibration is meaningfully better.
+EXTRACT_MODEL = "claude-haiku-4-5"
+REFLECT_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1024
 
 # Per docs/api.yaml Ticker pattern (post-normalization).
@@ -263,7 +268,7 @@ def parse_decision_text(text: str) -> ParseDecisionResponse:
 
     try:
         response = client.messages.create(
-            model=MODEL,
+            model=EXTRACT_MODEL,
             max_tokens=MAX_TOKENS,
             system=[
                 {
@@ -358,4 +363,393 @@ def parse_decision_text(text: str) -> ParseDecisionResponse:
         # TODO: replace with services.ticker_service.validate_ticker once that PR merges.
         ticker_validated=_validate_ticker_format(extracted.ticker),
         reasoning=raw.get("reasoning") or "",
+    )
+
+
+# ==========================================================================
+# Per-decision reflection (single-decision narrative)
+# ==========================================================================
+
+REFLECT_MAX_ATTEMPTS = 3
+REFLECT_MAX_TOKENS = 200
+
+# Phrases that violate PRD AI guardrails (5.2). Targeted at *recommendations*
+# and *predictions* — factual language like "you opted not to buy" is allowed,
+# since the no_buy scenario is meaningless without saying "buy".
+_FORBIDDEN_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        # Prescriptive language (telling user what to do)
+        r"\b(?:should|shouldn'?t|must|need\s+to|have\s+to|ought\s+to)\b",
+        # Explicit recommendations
+        r"\brecommend",
+        r"\b(?:I'?d|I\s+would)\s+(?:suggest|recommend|advise)\b",
+        r"\bmy\s+(?:advice|recommendation)\b",
+        # Imperative buy/sell phrasing (vs factual past-tense)
+        r"\b(?:time\s+to\s+(?:buy|sell)|opportunity\s+to\s+(?:buy|sell)|consider\s+(?:buying|selling))\b",
+        # Future price predictions
+        r"\bwill\s+(?:rise|fall|drop|jump|reach|hit|increase|decrease|gain|lose|continue)\b",
+        r"\b(?:likely|expected|going)\s+to\s+(?:rise|fall|drop|jump|reach|hit|increase|decrease|gain|lose|move|continue)\b",
+        # Prescriptive future references
+        r"\bnext\s+time\b",
+        r"\bgoing\s+forward\b",
+        r"\bin\s+the\s+future\b",
+        # Strategy suggestions
+        r"\bdiversify\b",
+        r"\bhold\s+longer\b",
+        r"\b(?:rebalance|stop[- ]loss|take\s+profits)\b",
+        # Internal enum / code-style values that should never appear in user copy.
+        # We only ban the underscore_form — plain English words like
+        # "outcome", "direction" must be allowed (they appear naturally).
+        r"\b(?:no_buy|no_sell|sold_too_early)\b",
+        r"\b(?:missed_gain|avoided_loss|kept_gain|endured_loss|cut_short_gain|well_timed_exit)\b",
+        r"\b(?:scenario_type|diff_percent|diff_amount|decision_price)\b",
+    ]
+]
+
+
+REFLECT_SYSTEM_PROMPT = """You are a decision reflection assistant for If-Vest, a personal-investor reflection tool. Given the result of a user's decision and (when available) their decision history, write a brief, neutral 1-2 sentence reflection that helps the user notice their own pattern — without telling them what to do.
+
+## Input format
+
+The user message contains:
+1. A "Current decision" block (always present) with ticker, action, price change, and result described in plain language.
+2. A "Previous decisions" list — either empty (first reflection) or up to 10 entries, most-recent-first, in the same block format.
+
+## Output language — IMPORTANT
+
+The input describes decisions in plain language (e.g. "considered buying but did not", "missed a potential gain"). **Your output must use the same plain language style.** Never use internal code-like terms in your reflection:
+
+NEVER WRITE:
+- "no_buy", "no_sell", "sold_too_early"
+- "missed_gain", "avoided_loss", "cut_short_gain", "well_timed_exit", "endured_loss", "kept_gain"
+- "scenario_type", "direction", "outcome"
+
+INSTEAD WRITE (natural English):
+- "you considered buying but didn't"
+- "you missed a substantial gain"
+- "you exited before a further rise"
+- "you held through a decline"
+
+## Behavior depends on history
+
+- **No previous decisions**: Reflect on this single decision. Don't claim to see "patterns" or "recurring" anything from one data point — that's dishonest. Use phrasing like "a useful first data point", "as you log more decisions, patterns will emerge", or just describe what happened without speculating.
+
+- **1-2 previous decisions**: Still too few for pattern claims. You may note "this is your second/third logged decision" or compare to one specific prior decision, but don't generalize.
+
+- **3+ previous decisions**: Now you can find genuine patterns. Count specific recurrences ("your fourth missed_gain in a row"), notice shifts ("your first favorable outcome after three unfavorable"), or identify themes (sectors, scenario types). Anchor every claim in the actual data shown — never invent.
+
+## What you write
+- Sentence 1: A factual observation about THIS decision (what happened, scale).
+- Sentence 2 (optional): A gentle, non-prescriptive observation that invites self-reflection — e.g. "worth noting if X is recurring for you."
+
+## Tone
+- Neutral and matter-of-fact. Like a mirror, not a coach.
+- Same weight for good outcomes and bad outcomes — don't dramatize losses or downplay wins.
+- Plain language. No jargon. No emojis. No exclamation marks.
+- One short paragraph. 1-2 sentences. ≤ 60 words.
+
+## STRICT prohibitions (NEVER do these)
+- DON'T recommend buying or selling. No "should buy", "time to sell", "consider buying", "opportunity to sell".
+- DON'T predict future prices. No "will rise", "will fall", "likely to drop", "going to recover".
+- DON'T give prescriptive advice. No "should", "shouldn't", "must", "need to", "ought to", "next time", "going forward".
+- DON'T suggest strategies. No "diversify", "hold longer", "rebalance", "take profits", "stop-loss".
+- DON'T use "I recommend", "my advice", "I'd suggest".
+
+## What IS allowed (and necessary)
+- Factual past-tense description of what they did: "you opted not to buy", "you sold AMZN", "you held AAPL through" — these are required to describe the scenario at all.
+- Restating the magnitude in plain language: "a 193% move", "modest", "substantial".
+- Mentioning the scenario: "you considered buying", "you held", "you exited".
+- Inviting reflection: "worth noting", "worth observing", "this kind of pattern shows up".
+- Tracking framing: "tracking how often X coincides with Y", "useful data point alongside other decisions".
+
+The line is: describe the past and invite reflection. Never tell them what to do or predict what comes next.
+
+## Examples — no history (first reflection)
+
+Input:
+Current decision:
+  - Ticker: NVDA
+  - User action: considered buying but did not on 2024-03-15
+  - Price change since: +193.32%
+  - Result: missed a potential gain (unfavorable outcome)
+Previous decisions: (none — this is the user's first reflection)
+
+Output:
+"You considered NVDA back then; the stock has nearly tripled since. As you log more decisions, this becomes the first data point in your own decision record."
+
+Input:
+Current decision:
+  - Ticker: META
+  - User action: considered buying but did not on 2025-12-01
+  - Price change since: -5.20%
+  - Result: avoided a potential loss (favorable outcome)
+Previous decisions: (none — this is the user's first reflection)
+
+Output:
+"You opted not to buy META; the stock has since declined 5.2%. A useful first data point — the value of this record grows as you add more decisions."
+
+## Examples — with history (genuine pattern observation)
+
+Input:
+Current decision:
+  - Ticker: NVDA
+  - User action: considered buying but did not on 2025-03-15
+  - Price change since: +193.32%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Previous decisions (3, most recent first):
+
+Previous decision #1:
+  - Ticker: TSLA
+  - User action: considered buying but did not on 2024-12-10
+  - Price change since: +45.00%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Previous decision #2:
+  - Ticker: AMD
+  - User action: considered buying but did not on 2024-10-01
+  - Price change since: +28.00%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Previous decision #3:
+  - Ticker: MSFT
+  - User action: sold the position on 2024-08-15
+  - Price change since: +12.00%
+  - Result: sold before further upside (unfavorable outcome)
+
+Output:
+"This is your fourth unfavorable outcome in a row, and the third time you stepped back from a high-conviction name and watched it run. NVDA's 193% move stands out as the largest by a wide margin — hesitation around momentum names is consistent across your record so far."
+
+Input:
+Current decision:
+  - Ticker: META
+  - User action: considered buying but did not on 2025-12-01
+  - Price change since: -5.20%
+  - Result: avoided a potential loss (favorable outcome)
+
+Previous decisions (5, most recent first):
+
+Previous decision #1:
+  - Ticker: NVDA
+  - User action: considered buying but did not on 2025-10-01
+  - Price change since: +15.00%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Previous decision #2:
+  - Ticker: AMD
+  - User action: considered buying but did not on 2025-08-15
+  - Price change since: +22.00%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Previous decision #3:
+  - Ticker: TSLA
+  - User action: sold the position on 2025-06-10
+  - Price change since: +8.00%
+  - Result: sold before further upside (unfavorable outcome)
+
+Previous decision #4:
+  - Ticker: AAPL
+  - User action: held a position and considered selling but did not on 2025-04-01
+  - Price change since: -12.00%
+  - Result: absorbed a decline by holding (unfavorable outcome)
+
+Previous decision #5:
+  - Ticker: GOOGL
+  - User action: considered buying but did not on 2025-02-15
+  - Price change since: +18.00%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Output:
+"Your first favorable outcome in your last six decisions — opting out of META aligned with a 5% pullback. A sharp contrast with your prior pattern of stepping back from names that subsequently rose."
+
+Input:
+Current decision:
+  - Ticker: AAPL
+  - User action: held a position and considered selling but did not on 2026-04-01
+  - Price change since: -8.50%
+  - Result: absorbed a decline by holding (unfavorable outcome)
+
+Previous decisions (2, most recent first):
+
+Previous decision #1:
+  - Ticker: TSLA
+  - User action: considered buying but did not on 2026-02-10
+  - Price change since: +12.00%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Previous decision #2:
+  - Ticker: NVDA
+  - User action: considered buying but did not on 2025-12-15
+  - Price change since: +8.00%
+  - Result: missed a potential gain (unfavorable outcome)
+
+Output:
+"You held AAPL through an 8.5% drawdown — your third logged decision, and the first time you've reflected on a hold-through-decline. Too few entries to call any pattern, but the record now spans different decision types."
+
+## Output rules
+
+- Respond with ONLY the reflection text. No preamble, no quotes, no markdown.
+- Use the same natural language found in your examples above.
+- Never use code-style enum values (no_buy, missed_gain, sold_too_early, etc.) — translate to plain English."""
+
+
+def _has_forbidden(text: str) -> Optional[str]:
+    """Return the first forbidden phrase found, or None if clean."""
+    for pattern in _FORBIDDEN_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0)
+    return None
+
+
+# Natural-language translations of internal enum values. We feed these to the
+# model instead of raw enum strings so it never echoes "no_buy" or
+# "missed_gain" verbatim in the output.
+from schemas.calculate import Direction as _Direction
+from schemas.calculate import Outcome as _Outcome
+from schemas.calculate import ScenarioType as _ScenarioType
+
+_SCENARIO_DESCRIPTIONS = {
+    _ScenarioType.NO_BUY: "considered buying but did not",
+    _ScenarioType.NO_SELL: "held a position and considered selling but did not",
+    _ScenarioType.SOLD_TOO_EARLY: "sold the position",
+}
+
+_DIRECTION_DESCRIPTIONS = {
+    _Direction.MISSED_GAIN: "missed a potential gain",
+    _Direction.AVOIDED_LOSS: "avoided a potential loss",
+    _Direction.KEPT_GAIN: "captured a gain by holding",
+    _Direction.ENDURED_LOSS: "absorbed a decline by holding",
+    _Direction.CUT_SHORT_GAIN: "sold before further upside",
+    _Direction.WELL_TIMED_EXIT: "sold before a decline",
+    _Direction.NEUTRAL: "saw minimal price change",
+}
+
+_OUTCOME_LABELS = {
+    _Outcome.FAVORABLE: "favorable",
+    _Outcome.UNFAVORABLE: "unfavorable",
+    _Outcome.NEUTRAL: "neutral",
+}
+
+
+def _format_decision_block(d, label: str) -> str:
+    """Render one decision as natural-language prose. Used for both the
+    current decision and each history entry.
+    """
+    return (
+        f"{label}:\n"
+        f"  - Ticker: {d.ticker}\n"
+        f"  - User action: {_SCENARIO_DESCRIPTIONS[d.scenario_type]} on {d.decision_date.isoformat()}\n"
+        f"  - Price change since: {d.diff_percent:+.2f}%\n"
+        f"  - Result: {_DIRECTION_DESCRIPTIONS[d.direction]} ({_OUTCOME_LABELS[d.outcome]} outcome)"
+    )
+
+
+def _format_reflect_input(req: ReflectRequest) -> str:
+    """Compose the user message. With history, the model anchors observations
+    in the user's actual record; without it, the reflection describes only
+    this decision.
+    """
+    current = _format_decision_block(req, "Current decision")
+    if not req.previous_decisions:
+        return f"{current}\n\nPrevious decisions: (none — this is the user's first reflection)"
+
+    history = "\n\n".join(
+        _format_decision_block(d, f"Previous decision #{idx + 1}")
+        for idx, d in enumerate(req.previous_decisions)
+    )
+    return (
+        f"{current}\n\n"
+        f"Previous decisions ({len(req.previous_decisions)}, most recent first):\n\n"
+        f"{history}"
+    )
+
+
+def generate_reflection(req: ReflectRequest) -> ReflectResponse:
+    """Generate a single-decision reflection. Retries up to 3 times if the
+    response trips a guardrail; returns degraded=True if all 3 fail.
+    """
+    client = _get_client()
+    user_message = _format_reflect_input(req)
+
+    for attempt in range(1, REFLECT_MAX_ATTEMPTS + 1):
+        try:
+            response = client.messages.create(
+                model=REFLECT_MODEL,
+                max_tokens=REFLECT_MAX_TOKENS,
+                system=[
+                    {
+                        "type": "text",
+                        "text": REFLECT_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except anthropic.RateLimitError:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "code": "RATE_LIMITED",
+                        "message": "LLM provider rate limit hit. Try again in a moment.",
+                    }
+                },
+            )
+        except anthropic.AuthenticationError:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": {
+                        "code": "INVALID_API_KEY",
+                        "message": "Server LLM authentication failed.",
+                    }
+                },
+            )
+        except anthropic.APIError as exc:
+            logger.warning("Anthropic API error during reflect: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": {
+                        "code": "LLM_PROVIDER_ERROR",
+                        "message": str(exc),
+                    }
+                },
+            )
+
+        # Pull the text out
+        text_block = next(
+            (block for block in response.content if block.type == "text"),
+            None,
+        )
+        if text_block is None:
+            logger.warning("Reflect attempt %d returned no text block", attempt)
+            continue
+        candidate = text_block.text.strip()
+        if not candidate:
+            logger.warning("Reflect attempt %d returned empty text", attempt)
+            continue
+
+        forbidden = _has_forbidden(candidate)
+        if forbidden is None:
+            return ReflectResponse(
+                reflection=candidate,
+                degraded=False,
+                attempts=attempt,
+            )
+
+        logger.info(
+            "Reflect attempt %d hit guardrail (%r): %s",
+            attempt,
+            forbidden,
+            candidate,
+        )
+
+    # All attempts violated guardrails — degrade gracefully
+    return ReflectResponse(
+        reflection="",
+        degraded=True,
+        attempts=REFLECT_MAX_ATTEMPTS,
     )

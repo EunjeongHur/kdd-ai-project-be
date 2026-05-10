@@ -587,6 +587,46 @@ components:
           type: boolean
           description: Whether the extracted ticker passed `/tickers/validate`.
 
+    # ---------- Reflect (per-decision) ----------
+    ReflectRequest:
+      type: object
+      required: [ticker, scenario_type, decision_date, diff_percent, direction, outcome]
+      description: |
+        Subset of CalculateResponse fields needed for narrative reflection.
+        Frontend should pass these directly from the /calculate response.
+      properties:
+        ticker: { $ref: "#/components/schemas/Ticker" }
+        scenario_type: { $ref: "#/components/schemas/ScenarioType" }
+        decision_date: { $ref: "#/components/schemas/DateOnly" }
+        diff_percent:
+          type: number
+          description: Signed percent change (used for magnitude phrasing).
+          example: 193.32
+        direction: { $ref: "#/components/schemas/Direction" }
+        outcome: { $ref: "#/components/schemas/Outcome" }
+
+    ReflectResponse:
+      type: object
+      required: [reflection, degraded, attempts]
+      properties:
+        reflection:
+          type: string
+          description: |
+            1-2 sentence neutral observation. Empty string when guardrails
+            forced a fallback (see `degraded`).
+          example: "You considered NVDA back then; the stock has nearly tripled since. Worth noting how hesitation around high-conviction names shows up in your decisions over time."
+        degraded:
+          type: boolean
+          description: |
+            True when output post-processing rejected three consecutive
+            attempts. Frontend should hide the reflection block and show only
+            the numeric result.
+        attempts:
+          type: integer
+          minimum: 1
+          maximum: 3
+          description: Number of generation attempts (telemetry).
+
     # ---------- Ops ----------
     HealthResponse:
       type: object
@@ -998,6 +1038,42 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ParseDecisionResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/UpstreamError" }
+
+  # ========== Reflect (per-decision narrative, distinct from F-06) ==========
+  /reflect:
+    post:
+      tags: [ai]
+      summary: Per-decision narrative reflection
+      description: |
+        Generates a 1-2 sentence neutral observation about a single decision.
+        Distinct from F-06 (`/patterns/insights`), which analyzes 10+
+        accumulated decisions. This endpoint runs on every form submission to
+        surface a short narrative alongside the numeric result from `/calculate`.
+
+        Per PRD AI guardrails (5.2), output is post-processed for forbidden
+        phrases (`buy`, `sell`, `should`, `will rise`, etc.). On guardrail
+        violation the model is regenerated up to 3 times. After 3 failures the
+        endpoint returns `reflection: ""` with `degraded: true` — the frontend
+        should fall back to showing only the numeric result.
+
+        Per-user rate limit: 10/day (TBD — not enforced for MVP demo).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReflectRequest" }
+      responses:
+        "200":
+          description: Reflection text (or degraded fallback)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReflectResponse" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { $ref: "#/components/responses/ValidationError" }
         "429": { $ref: "#/components/responses/RateLimited" }
