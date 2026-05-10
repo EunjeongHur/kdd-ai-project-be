@@ -25,6 +25,7 @@ from schemas.parse_decision import (
     ParseDecisionResponse,
 )
 from schemas.reflect import ReflectRequest, ReflectResponse
+from services import ticker_service
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +35,6 @@ logger = logging.getLogger(__name__)
 EXTRACT_MODEL = "claude-haiku-4-5"
 REFLECT_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 1024
-
-# Per docs/api.yaml Ticker pattern (post-normalization).
-_TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
-
 
 # --------------------------------------------------------------------------
 # Static, cacheable system prompt
@@ -251,10 +248,18 @@ def _get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
 
-def _validate_ticker_format(ticker: Optional[str]) -> bool:
+def _ticker_exists(ticker: Optional[str]) -> bool:
+    """Real existence check via ticker_service: format -> static index -> yfinance."""
     if ticker is None:
         return False
-    return bool(_TICKER_PATTERN.fullmatch(ticker))
+    normalized = ticker_service.normalize_ticker(ticker)
+    if not ticker_service.is_valid_ticker_format(normalized):
+        return False
+    try:
+        return ticker_service.validate_ticker(normalized).valid
+    except Exception as exc:
+        logger.warning("Ticker validation failed for %r: %s", ticker, exc)
+        return False
 
 
 def parse_decision_text(text: str) -> ParseDecisionResponse:
@@ -360,8 +365,7 @@ def parse_decision_text(text: str) -> ParseDecisionResponse:
     return ParseDecisionResponse(
         extracted=extracted,
         confidence=confidence,
-        # TODO: replace with services.ticker_service.validate_ticker once that PR merges.
-        ticker_validated=_validate_ticker_format(extracted.ticker),
+        ticker_validated=_ticker_exists(extracted.ticker),
         reasoning=raw.get("reasoning") or "",
     )
 
