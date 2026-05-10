@@ -5,7 +5,7 @@ spinning up FastAPI or yfinance.
 """
 from typing import Optional
 
-from schemas.calculate import Direction, Outcome, ScenarioType
+from schemas.calculate import DecisionPriceSource, Direction, Outcome, ScenarioType
 
 # Below this absolute percent move, we call the outcome neutral.
 NEUTRAL_THRESHOLD_PERCENT = 0.5
@@ -62,26 +62,43 @@ def derive_was_correct(outcome: Outcome) -> Optional[bool]:
 
 
 def compute_diffs(
-    decision_price: float,
+    decision_price_yf: float,
     current_price: float,
     quantity: Optional[float],
     amount: Optional[float],
-) -> tuple[float, float]:
-    """Return (diff_amount, diff_percent). Sign reflects price move.
+) -> tuple[float, float, float, DecisionPriceSource]:
+    """Resolve the effective decision_price and compute (diff_amount, diff_percent).
 
-    XOR enforcement is the request schema's job; this helper just trusts the
-    inputs and falls through to a sensible default if neither is set (which
-    shouldn't happen in production).
+    Returns: (diff_amount, diff_percent, decision_price, source)
+
+    Cases:
+      1. quantity + amount  → decision_price = amount / quantity (user's actual fill)
+      2. quantity only      → decision_price = decision_price_yf (yfinance close)
+      3. amount only        → decision_price = decision_price_yf (yfinance close)
+
+    Diff sign always reflects the price move (positive when price went up).
+
+    Schema validator guarantees at least one of quantity/amount is set; if
+    somehow both are None we fall through with a zero diff to avoid crashing.
     """
-    diff_percent = ((current_price - decision_price) / decision_price) * 100
-
-    if quantity is not None:
+    if quantity is not None and amount is not None:
+        decision_price = amount / quantity
+        diff_amount = quantity * current_price - amount
+        source = DecisionPriceSource.USER
+    elif quantity is not None:
+        decision_price = decision_price_yf
         diff_amount = (current_price - decision_price) * quantity
+        source = DecisionPriceSource.YFINANCE
     elif amount is not None:
-        # Ratio-based: preserves fractional shares. amount * (current/decision - 1)
+        decision_price = decision_price_yf
+        # Ratio-based: preserves fractional shares.
         diff_amount = amount * (current_price / decision_price - 1)
+        source = DecisionPriceSource.YFINANCE
     else:
-        # Schema validator should have blocked this; fall through harmlessly.
+        # Schema validator should have blocked this; defensive fallback.
+        decision_price = decision_price_yf
         diff_amount = 0.0
+        source = DecisionPriceSource.YFINANCE
 
-    return diff_amount, diff_percent
+    diff_percent = ((current_price - decision_price) / decision_price) * 100
+    return diff_amount, diff_percent, decision_price, source

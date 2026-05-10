@@ -89,6 +89,14 @@ components:
         - `unfavorable`: missed_gain | endured_loss | cut_short_gain
         - `neutral`: neutral
 
+    DecisionPriceSource:
+      type: string
+      enum: [user, yfinance]
+      description: |
+        Where `decision_price` in the response came from.
+        - `user`: derived as `amount / quantity` because the request supplied both.
+        - `yfinance`: adjusted close on `actual_date_used`.
+
     ScenarioType:
       type: string
       enum: [no_buy, no_sell, sold_too_early]
@@ -166,6 +174,12 @@ components:
     CalculateRequest:
       type: object
       required: [ticker, scenario_type, decision_date]
+      description: |
+        At least one of `quantity` / `amount` is required; both may be supplied.
+        When both are present, the response's `decision_price` is derived as
+        `amount / quantity` (treated as the user's actual fill price), and
+        `decision_price_source` will be `user`. Otherwise yfinance close is used
+        and the source is `yfinance`.
       properties:
         ticker: { $ref: "#/components/schemas/Ticker" }
         scenario_type: { $ref: "#/components/schemas/ScenarioType" }
@@ -173,16 +187,16 @@ components:
         quantity:
           type: number
           minimum: 0.0001
-          description: Shares. XOR with `amount`.
+          description: Shares (fractional allowed).
         amount:
           type: number
           minimum: 0.01
-          description: USD amount. XOR with `quantity`.
-      oneOf:
+          description: |
+            USD amount. If supplied alongside `quantity`, treated as the actual
+            transaction value — `decision_price` becomes `amount / quantity`.
+      anyOf:
         - required: [quantity]
-          not: { required: [amount] }
         - required: [amount]
-          not: { required: [quantity] }
 
     CalculateResponse:
       type: object
@@ -192,6 +206,7 @@ components:
         - decision_date
         - actual_date_used
         - decision_price
+        - decision_price_source
         - current_price
         - current_date
         - diff_amount
@@ -209,13 +224,20 @@ components:
         actual_date_used:
           allOf: [{ $ref: "#/components/schemas/DateOnly" }]
           description: |
-            Trading day actually used for `decision_price`. Differs from
-            `decision_date` only when that date was a market holiday or weekend
-            (in which case we use the most recent prior trading day).
+            Trading day actually used for the yfinance close lookup. Differs
+            from `decision_date` only when that date was a market holiday or
+            weekend (we use the most recent prior trading day). Note: this is
+            the date used for the yfinance lookup; the effective decision_price
+            may still be user-supplied (see `decision_price_source`).
         decision_price:
           type: number
-          description: Adjusted close on `actual_date_used`.
+          description: |
+            Reference price at decision_date. When the request supplied both
+            `quantity` and `amount`, this is `amount / quantity` (treated as
+            the user's actual fill). Otherwise it's the yfinance adjusted
+            close on `actual_date_used`. See `decision_price_source`.
           example: 118.50
+        decision_price_source: { $ref: "#/components/schemas/DecisionPriceSource" }
         current_price:
           type: number
           example: 142.30
@@ -228,9 +250,11 @@ components:
         diff_amount:
           type: number
           description: |
-            (current_price - decision_price) * quantity, OR
-            amount * (current_price / decision_price - 1) if amount-based.
-            Sign is always relative to the price move (positive when price went up).
+            Profit/loss the position would represent at `current_price`.
+            Sign reflects price move (positive when price went up).
+            - quantity + amount given: `quantity * current_price - amount`
+            - quantity only:           `(current_price - decision_price) * quantity`
+            - amount only:             `amount * (current_price / decision_price - 1)`
           example: 238.00
         diff_percent:
           type: number
@@ -305,6 +329,10 @@ components:
     DecisionInput:
       type: object
       required: [ticker, scenario_type, decision_date]
+      description: |
+        At least one of `quantity` / `amount` is required; both may be supplied.
+        When both are present, the saved decision uses `amount / quantity` as
+        the effective decision_price (treated as the user's actual fill).
       properties:
         ticker: { $ref: "#/components/schemas/Ticker" }
         scenario_type: { $ref: "#/components/schemas/ScenarioType" }
@@ -322,11 +350,9 @@ components:
           type: string
           maxLength: 500
           nullable: true
-      oneOf:
+      anyOf:
         - required: [quantity]
-          not: { required: [amount] }
         - required: [amount]
-          not: { required: [quantity] }
 
     Decision:
       type: object
@@ -371,11 +397,9 @@ components:
           nullable: true
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
-      oneOf:
+      anyOf:
         - required: [quantity]
-          not: { required: [amount] }
         - required: [amount]
-          not: { required: [quantity] }
 
     DecisionWithCurrent:
       allOf:
