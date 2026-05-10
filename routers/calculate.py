@@ -1,45 +1,100 @@
-from fastapi import APIRouter
-from schemas.calculate import CalcRequest, CalcResponse, ScenarioType
+"""POST /calculate — F-01 opportunity-cost computation.
+
+See docs/api.yaml CalculateRequest / CalculateResponse and docs/conventions.md
+for the contract this implements.
+"""
+import re
+from datetime import date
+
+from fastapi import APIRouter, HTTPException
+
+from schemas.calculate import (
+    CalculateRequest,
+    CalculateResponse,
+)
+from services.calculate_service import (
+    compute_diffs,
+    derive_direction,
+    derive_outcome,
+    derive_was_correct,
+)
 from services.yfinance_service import get_market_data
 
-router = APIRouter(prefix="/calculate", tags=["Calculation"])
+# Inline ticker normalization + format check.
+# When the ticker PR (services/ticker_service.py) merges, swap these for
+# the shared helpers from there.
+_TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
-@router.post("", response_model=CalcResponse)
-@router.post("", response_model=CalcResponse)
-async def calculate_opportunity_cost(req: CalcRequest):
-    past_price, current_price = get_market_data(req.ticker, req.target_date)
 
-    qty = req.quantity if req.quantity else int(req.amount // past_price)
-    if qty <= 0: qty = 1
+def _normalize_ticker(raw: str) -> str:
+    t = raw.strip().upper()
+    t = re.sub(r"[\s/.]+", "-", t)
+    return t.strip("-")
 
-    # Enum 비교 방식으로 변경
-    if req.scenario_type in [ScenarioType.NO_BUY, ScenarioType.SELL_THEN_RISE]:
-        diff_val = current_price - past_price
-    elif req.scenario_type == ScenarioType.NO_SELL:
-        diff_val = past_price - current_price
-    else:
-        diff_val = 0
 
-    diff_amount = diff_val * qty
-    diff_percent = (diff_val / past_price) * 100
+def _is_valid_ticker_format(ticker: str) -> bool:
+    return bool(_TICKER_PATTERN.fullmatch(ticker))
 
-    # Principle 5.2 준수: 중립적인 영어 메시지
-    # "This decision resulted in a +15.50% difference in outcome."
-    message = f"This decision resulted in a {abs(diff_percent):.2f}% difference in outcome."
 
-    if diff_amount > 0:
-        status_color, icon = "red", "📉"
-    elif diff_amount < 0:
-        status_color, icon = "green", "📈"
-    else:
-        status_color, icon = "gray", "➖"
+router = APIRouter(prefix="/calculate", tags=["calculate"])
 
-    return CalcResponse(
-        past_price=round(past_price, 2),
-        current_price=round(current_price, 2),
-        diff_amount=round(abs(diff_amount), 2),
-        diff_percent=round(abs(diff_percent), 2),
-        message=message,
-        status_color=status_color,
-        icon=icon
+
+@router.post("", response_model=CalculateResponse)
+def calculate_opportunity_cost(req: CalculateRequest) -> CalculateResponse:
+    # --- Ticker normalization + format check ---
+    ticker = _normalize_ticker(req.ticker)
+    if not _is_valid_ticker_format(ticker):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "INVALID_TICKER_FORMAT",
+                    "message": (
+                        "Ticker must be 1-10 characters, start with a letter, "
+                        "and contain only letters, digits, '.' or '-'."
+                    ),
+                }
+            },
+        )
+
+    # --- Future-date guard ---
+    if req.decision_date > date.today():
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": {
+                    "code": "DATE_IN_FUTURE",
+                    "message": "decision_date cannot be in the future.",
+                }
+            },
+        )
+
+    # --- Market data lookup (raises 422/502 internally on failure) ---
+    market = get_market_data(ticker, req.decision_date)
+
+    # --- Pure derivations ---
+    diff_amount, diff_percent = compute_diffs(
+        decision_price=market.decision_price,
+        current_price=market.current_price,
+        quantity=req.quantity,
+        amount=req.amount,
+    )
+    direction = derive_direction(req.scenario_type, diff_percent)
+    outcome = derive_outcome(direction)
+    was_correct = derive_was_correct(outcome)
+
+    return CalculateResponse(
+        ticker=ticker,
+        scenario_type=req.scenario_type,
+        decision_date=req.decision_date,
+        actual_date_used=market.actual_date_used,
+        decision_price=round(market.decision_price, 4),
+        current_price=round(market.current_price, 4),
+        current_date=market.current_date,
+        diff_amount=round(diff_amount, 2),
+        diff_percent=round(diff_percent, 2),
+        direction=direction,
+        outcome=outcome,
+        was_decision_correct=was_correct,
+        split_adjusted=True,
     )
