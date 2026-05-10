@@ -5,11 +5,15 @@ See docs/api.yaml for the full contract.
 """
 from typing import Optional
 
+from dotenv import load_dotenv  # Load .env BEFORE any module that reads env vars
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from routers.calculate import router as calculate_router
+from routers.parse_decision import router as parse_decision_router
 
 
 APP_VERSION = "0.2.0"
@@ -36,6 +40,7 @@ app.add_middleware(
 )
 
 app.include_router(calculate_router)
+app.include_router(parse_decision_router)
 
 class HealthResponse(BaseModel):
     status: str
