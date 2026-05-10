@@ -133,6 +133,10 @@ components:
     TickerValidation:
       type: object
       required: [ticker, valid]
+      description: |
+        When `valid: false`, all metadata fields (`name`, `exchange`) are null.
+        When `valid: true`, `name` is populated; `exchange` may still be null
+        if the upstream source didn't return it.
       properties:
         ticker: { $ref: "#/components/schemas/Ticker" }
         valid: { type: boolean }
@@ -144,14 +148,14 @@ components:
           type: string
           nullable: true
           example: "NASDAQ"
-        currency:
-          type: string
-          nullable: true
-          example: "USD"
 
     TickerSearchItem:
       type: object
       required: [ticker, name]
+      description: |
+        Search only returns existing tickers, so `name` is always populated.
+        Only `EQUITY` and `ETF` quote types are returned (no mutual funds,
+        currencies, futures, or crypto).
       properties:
         ticker: { $ref: "#/components/schemas/Ticker" }
         name:
@@ -681,8 +685,18 @@ paths:
       tags: [tickers]
       summary: Validate a ticker symbol
       description: |
-        Returns whether the ticker exists on Yahoo Finance. Public endpoint.
+        Returns whether the ticker exists. Public endpoint.
         Used by client form on every input change (debounced).
+
+        **Normalization**: Input is uppercased and whitespace-stripped before
+        validation. `?ticker=appl` is treated as `AAPL`. The pattern check
+        on `Ticker` runs against the normalized form.
+
+        **Lookup order**: static index (NASDAQ + NYSE listings shipped with
+        the backend, ~5000 entries) first; if not found, fall back to
+        yfinance live lookup.
+
+        **Cache TTL**: 24 hours per ticker (existence rarely changes).
       parameters:
         - name: ticker
           in: query
@@ -691,8 +705,8 @@ paths:
       responses:
         "200":
           description: |
-            Validation result. Note: invalid tickers return 200 with `valid: false`,
-            not 404. This makes client debouncing simpler.
+            Validation result. Invalid tickers return 200 with `valid: false`
+            (not 404), to keep client debouncing simple.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TickerValidation" }
@@ -705,15 +719,33 @@ paths:
       summary: Autocomplete ticker by name or symbol prefix
       description: |
         Used by the input form for autocomplete. Public endpoint.
-        Backend can use yfinance's quote search or a static SP500 file as fallback.
+
+        **Lookup order**: static index (NASDAQ + NYSE listings, ~5000 entries)
+        first; augment with yfinance live search only when static yields
+        fewer than 3 results.
+
+        **Filter**: only `EQUITY` and `ETF` quote types are returned.
+
+        **Empty q**: returns `200 { items: [] }` (NOT 422). Frontends often
+        clear the input; the backend handles that gracefully so the client
+        doesn't need a guard.
+
+        **Upstream failure**: if yfinance throws or times out, fall back to
+        whatever the static index produced (or empty list). Search must not
+        return 502; degrading to fewer results is acceptable.
+
+        **Ranking**: ticker prefix match > name prefix match > name substring
+        match. Within a tier, alphabetical by ticker.
+
+        **Cache TTL**: 1 hour per query string.
       parameters:
         - name: q
           in: query
-          required: true
+          required: false
           schema:
             type: string
-            minLength: 1
             maxLength: 50
+            default: ""
             example: "appl"
         - name: limit
           in: query
@@ -724,12 +756,11 @@ paths:
             default: 10
       responses:
         "200":
-          description: Up to `limit` suggestions, ranked by relevance.
+          description: Up to `limit` suggestions, ranked by relevance. Empty `q` returns empty `items`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TickerSearchResponse" }
         "422": { $ref: "#/components/responses/ValidationError" }
-        "502": { $ref: "#/components/responses/UpstreamError" }
 
   # ========== Calculate (F-01) ==========
   /calculate:
