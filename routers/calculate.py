@@ -73,8 +73,8 @@ def calculate_opportunity_cost(req: CalculateRequest) -> CalculateResponse:
     market = get_market_data(ticker, req.decision_date)
 
     # --- Pure derivations ---
-    diff_amount, diff_percent = compute_diffs(
-        decision_price=market.decision_price,
+    diff_amount, diff_percent, decision_price, price_source = compute_diffs(
+        decision_price_yf=market.decision_price,
         current_price=market.current_price,
         quantity=req.quantity,
         amount=req.amount,
@@ -88,7 +88,8 @@ def calculate_opportunity_cost(req: CalculateRequest) -> CalculateResponse:
         scenario_type=req.scenario_type,
         decision_date=req.decision_date,
         actual_date_used=market.actual_date_used,
-        decision_price=round(market.decision_price, 4),
+        decision_price=round(decision_price, 4),
+        decision_price_source=price_source,
         current_price=round(market.current_price, 4),
         current_date=market.current_date,
         diff_amount=round(diff_amount, 2),

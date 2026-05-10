@@ -61,7 +61,7 @@ Single shape across all endpoints:
 | `403` | Authenticated but not authorized |
 | `404` | Resource not found |
 | `409` | Business-rule conflict (e.g. 50-decision cap reached) |
-| `422` | Validation failure (bad date, missing field, XOR violation, range too large) |
+| `422` | Validation failure (bad date, missing field, range too large) |
 | `429` | Rate limit hit |
 | `500` | Unhandled server error |
 | `502` / `503` | Yahoo Finance / LLM provider down |
@@ -73,8 +73,7 @@ Single shape across all endpoints:
 - `DATE_IN_FUTURE` — 422
 - `DATE_BEFORE_LISTING` — 422
 - `RANGE_TOO_LARGE` — 422 (>5y on /price-history or /optimal-timing)
-- `QUANTITY_AND_AMOUNT_BOTH` — 422 (XOR violation)
-- `QUANTITY_AND_AMOUNT_NEITHER` — 422
+- `QUANTITY_AND_AMOUNT_NEITHER` — 422 (must provide at least one)
 - `END_DATE_BEFORE_START` — 422
 - `DECISION_LIMIT_REACHED` — 409 (50-cap)
 - `RATE_LIMITED` — 429
@@ -203,7 +202,12 @@ Sort descending, take top 3. Ties broken by `created_at` descending (more recent
 
 ## 14. Request validation rules (server-side, regardless of client)
 
-- `quantity` and `amount` are XOR. Exactly one must be present.
+- At least one of `quantity` / `amount` must be present; both may be supplied.
+  When both are present, the effective `decision_price` is computed as
+  `amount / quantity` (treated as the user's actual transaction price) and
+  the response field `decision_price_source` is `user`. When only one is
+  supplied, the yfinance adjusted close on `actual_date_used` is used and
+  `decision_price_source` is `yfinance`.
 - `quantity > 0`, `amount > 0`.
 - `decision_date <= today`.
 - `end_date >= decision_date` (when provided).
