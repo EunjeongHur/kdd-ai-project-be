@@ -634,27 +634,12 @@ def _has_forbidden(text: str) -> Optional[str]:
     return None
 
 
-# F-06 insights talk about decision history at the aggregate level. Users see
-# scenario labels like "No Buy" on every card, so the LLM saying "your no_buy
-# decisions..." is correct usage, not an internal-string leak. Direction
-# values (missed_gain, avoided_loss, etc.) are still hidden — those are
-# computed states the user never sees as a label.
-_INSIGHTS_FORBIDDEN_PATTERNS = [
-    p
-    for p in _FORBIDDEN_PATTERNS
-    if p.pattern != r"\b(?:no_buy|no_sell|sold_too_early)\b"
-]
-
-
-def _has_forbidden_insight(text: str) -> Optional[str]:
-    """Guardrail check for /patterns/insights output. Looser than /reflect's
-    check: permits the scenario-type enum strings since those double as the
-    user-facing label."""
-    for pattern in _INSIGHTS_FORBIDDEN_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return match.group(0)
-    return None
+# For F-06 insights, all internal enums are translated to user-facing labels
+# in format_insights_context BEFORE the LLM ever sees them. That way the
+# strict _FORBIDDEN_PATTERNS list (same as /reflect) can stay intact — there's
+# no internal-string echo to permit, because we never gave the model one.
+# Mappings live just below the _ScenarioType import where the rest of the
+# enum-translation tables already are.
 
 
 # Natural-language translations of internal enum values. We feed these to the
@@ -684,6 +669,15 @@ _OUTCOME_LABELS = {
     _Outcome.FAVORABLE: "favorable",
     _Outcome.UNFAVORABLE: "unfavorable",
     _Outcome.NEUTRAL: "neutral",
+}
+
+# User-facing scenario labels (used by F-06 insights context so the LLM
+# never sees the raw `no_buy` enum strings). These match the labels shown
+# on each decision card in the frontend.
+_SCENARIO_UI_LABELS = {
+    _ScenarioType.NO_BUY: "No Buy",
+    _ScenarioType.NO_SELL: "No Sell",
+    _ScenarioType.SOLD_TOO_EARLY: "Sold Early",
 }
 
 
@@ -819,7 +813,7 @@ INSIGHTS_MODEL = REFLECT_MODEL  # Sonnet 4.6 — same tone calibration as /refle
 INSIGHTS_MAX_TOKENS = 800
 INSIGHTS_MAX_ATTEMPTS = 3
 INSIGHTS_MIN_COUNT = 3
-INSIGHTS_MAX_COUNT = 5
+INSIGHTS_MAX_COUNT = 4
 
 
 @dataclass
@@ -832,17 +826,17 @@ class InsightsResult:
 
 INSIGHTS_SYSTEM_PROMPT = """You are analyzing a personal investor's full decision history for If-Vest to surface observational patterns.
 
-Your job: read the aggregated stats in the user message and call the `report_insights` tool with 3-5 one-sentence behavioral observations the user could not have seen at a glance from a single chart.
+Your job: read the aggregated stats in the user message and call the `report_insights` tool with 3-4 one-sentence observations that make the user *pause* — not academic descriptions of their record.
 
 ## What counts as an insight
 
 An insight earns its place by doing ONE of the following:
 
 1. **Cross-cut two or more dimensions** — show how a stat *interacts* with another, not just its value.
-   Example: "When confident on no_sell, your win rate is 100% (2 of 2); when confident on no_buy, it drops to 33%." Two dimensions: emotion x scenario.
+   Example: "When confident on No Sell, your win rate is 100% (2 of 2); when confident on No Buy, it drops to 33%."
 
 2. **Spotlight a specific named decision** — use the regret spotlight in the input. Reference ticker + date + magnitude.
-   Example: "Your largest miss is GOOGL sold March 2025 at $164; it has since reached $401 (+145%) — your single biggest opportunity cost in the record."
+   Example: "Your largest miss is GOOGL (Sold Early) on March 2025; it has since risen +145% — your single biggest opportunity cost in the record."
 
 3. **Compare time periods** — use the first-half vs second-half split provided.
    Example: "Your win rate has dropped from 50% in your earliest 8 decisions to 25% in your most recent 8."
@@ -859,21 +853,22 @@ The single biggest failure mode is rephrasing one row of the input. If your sent
 
 ### Examples of narration (NEVER write these — they restate input)
 - "NVDA appears in 9 of 16 logged decisions." → narration, that's literally a line in the stats
-- "All 3 sold_too_early decisions were unfavorable." → narration, also a stats line
-- "no_buy is the dominant scenario at 8 of 16, with 6 unfavorable." → narration, that's the scenario x outcome row
+- "All 3 Sold Early decisions were unfavorable." → narration, also a stats line
+- "No Buy is the dominant decision-type at 8 of 16, with 6 unfavorable." → narration, that's the decision-type x outcome row
 
 ### Same data, rewritten as insight (cross-cut, contrast, spotlight)
-- "NVDA accounts for 9 of your 16 decisions but produced 5 unfavorable outcomes — your high-concentration name is also your highest-miss name."
-- "Every sold_too_early decision was unfavorable (3 of 3), while no_sell was your only scenario without an unfavorable result — opposite outcomes from opposite restraints."
-- "Your no_buy decisions are 75% unfavorable when felt anxious (3 of 4) but improve to a single unfavorable when confident — emotion correlates more than scenario here."
+- "NVDA accounts for 9 of your 16 decisions but produced 5 unfavorable outcomes — your most-logged ticker is also your highest-miss ticker."
+- "Every Sold Early decision was unfavorable (3 of 3), while No Sell was your only decision-type without a single unfavorable result — opposite outcomes from opposite restraints."
+- "Your No Buy decisions are 75% unfavorable when felt anxious (3 of 4) but improve to a single unfavorable when confident — emotion correlates more than decision-type here."
 
 ## Tone & language
 
-- Plain observational. 1 sentence per insight.
-- Reference SPECIFIC numbers — counts, rates, dates, ticker names.
-- The scenario type strings (`no_buy`, `no_sell`, `sold_too_early`) ARE the user-facing labels — use them verbatim.
-- Translate other internal enums to plain English ("missed_gain" → "missing a gain", "cut_short_gain" → "selling before further upside").
-- Neutral analyst voice. Not a coach. Not a friend.
+- Direct, second-person. "You sold GOOGL at $164..." not "The user's GOOGL sale at $164...".
+- **Use the dollar-amount stakes when present in the regret spotlight.** "$2,800 of missed gain" lands harder than "+145%" alone.
+- 1 sentence per insight. Each can be moderately long if it carries real weight; don't pad to look thorough.
+- Reference SPECIFIC numbers — counts, rates, dates, ticker names, dollar amounts.
+- Use the labels exactly as they appear in the stats block (e.g., "No Buy", "No Sell", "Sold Early", "favorable", "missed a gain"). These match the labels the user sees on their decision cards.
+- Neutral but pointed. Not academic, not coachy.
 
 ## Hard prohibitions
 
@@ -881,15 +876,15 @@ The single biggest failure mode is rephrasing one row of the input. If your sent
 - No prediction: "will rise/fall", "likely to", "expected to", "going to".
 - No strategy verbs: "diversify", "rebalance", "take profits", "stop-loss", "hold longer".
 - No "recommend", "suggest", "advise".
-- No leaked internal enums beyond scenario_type (no `missed_gain`, `direction`, `diff_percent` as words in your output).
+- No amateur psychology ("this shows your fear of..."): describe the data, don't theorize about the user's mind.
 - No emojis, no exclamation marks.
 - No generalization from any cell with under 3 entries. If emotion=cautious has n=2, you may NOT say "cautious decisions tend to..."
 
 ## Output rules
 
 - ALWAYS call `report_insights`. No plain text.
-- Return 3-5 insights. Drop any narration-style sentence even if it leaves you with only 3.
-- Order: most striking cross-cut or spotlight first.
+- Return 3-4 insights. Quality over quantity — three pointed observations beat five medium ones. Drop any narration-style sentence even if it leaves you with just three.
+- Order: most striking cross-cut or spotlight first. The first insight should be the one most likely to make the user stop scrolling.
 """
 
 
@@ -938,11 +933,13 @@ def _favorable_rate(counts: dict[str, int]) -> Optional[float]:
 def format_insights_context(items) -> str:
     """Format decision history as a brief for the LLM.
 
+    All internal enum strings are translated to user-facing labels before
+    going into the prompt, so the LLM never sees `no_buy` / `missed_gain` /
+    etc. and therefore can't echo them back into the user-visible output.
+
     Goes beyond per-dimension counts: surfaces cross-dimension cells
     (emotion x scenario), time splits (first half vs second half by
-    created_at), and named high-regret decisions. The point is to give
-    the model something to *compare* — narration-style insights happen
-    when only single-axis stats are present.
+    created_at), and named high-regret decisions.
 
     `items` is a list of DecisionWithCurrent (most-recent-first by
     created_at, per get_user_decisions' default sort).
@@ -950,12 +947,24 @@ def format_insights_context(items) -> str:
     total = len(items)
     lines = [f"Total logged decisions: {total}"]
 
-    scenario_counts = _count_dict(items, lambda it: it.scenario_type.value)
-    outcome_counts = _count_dict(items, lambda it: it.outcome.value if it.outcome else None)
-    emotion_counts = _count_dict(items, lambda it: it.emotion.value if it.emotion else None)
-    direction_counts = _count_dict(items, lambda it: it.direction.value if it.direction else None)
+    def scenario_label(it) -> str:
+        return _SCENARIO_UI_LABELS[it.scenario_type]
 
-    lines.append("\nScenario distribution:")
+    def direction_label(it) -> Optional[str]:
+        return _DIRECTION_DESCRIPTIONS[it.direction] if it.direction else None
+
+    def outcome_label(it) -> Optional[str]:
+        return _OUTCOME_LABELS[it.outcome] if it.outcome else None
+
+    def emotion_label(it) -> Optional[str]:
+        return it.emotion.value if it.emotion else None
+
+    scenario_counts = _count_dict(items, scenario_label)
+    outcome_counts = _count_dict(items, outcome_label)
+    emotion_counts = _count_dict(items, emotion_label)
+    direction_counts = _count_dict(items, direction_label)
+
+    lines.append("\nDecision-type distribution:")
     for s, c in sorted(scenario_counts.items(), key=lambda x: -x[1]):
         lines.append(f"  - {s}: {c}")
 
@@ -963,7 +972,7 @@ def format_insights_context(items) -> str:
     for o, c in sorted(outcome_counts.items(), key=lambda x: -x[1]):
         lines.append(f"  - {o}: {c}")
 
-    lines.append("\nDirection distribution:")
+    lines.append("\nResult description distribution:")
     for d, c in sorted(direction_counts.items(), key=lambda x: -x[1]):
         lines.append(f"  - {d}: {c}")
 
@@ -974,18 +983,18 @@ def format_insights_context(items) -> str:
     else:
         lines.append("\nEmotion at decision time: not logged for any decision yet.")
 
-    # Scenario × outcome
+    # Decision-type x outcome
     scenario_outcome: dict[str, dict[str, int]] = {}
     for it in items:
         if not it.outcome:
             continue
-        s_key = it.scenario_type.value
-        o_key = it.outcome.value
+        s_key = scenario_label(it)
+        o_key = outcome_label(it)
         scenario_outcome.setdefault(s_key, {})[o_key] = (
             scenario_outcome.get(s_key, {}).get(o_key, 0) + 1
         )
     if scenario_outcome:
-        lines.append("\nScenario x outcome breakdown:")
+        lines.append("\nDecision-type x outcome breakdown:")
         for s, counts in scenario_outcome.items():
             total_s = sum(counts.values())
             fav = counts.get("favorable", 0)
@@ -997,14 +1006,14 @@ def format_insights_context(items) -> str:
                 f"  - {s} (n={total_s}): {fav} favorable, {unfav} unfavorable, {neutral} neutral{rate_str}"
             )
 
-    # Emotion × outcome (only emotions with entries)
+    # Emotion x outcome (only emotions with entries)
     if emotion_counts:
         emotion_outcome: dict[str, dict[str, int]] = {}
         for it in items:
             if not it.emotion or not it.outcome:
                 continue
-            e_key = it.emotion.value
-            o_key = it.outcome.value
+            e_key = emotion_label(it)
+            o_key = outcome_label(it)
             emotion_outcome.setdefault(e_key, {})[o_key] = (
                 emotion_outcome.get(e_key, {}).get(o_key, 0) + 1
             )
@@ -1018,22 +1027,21 @@ def format_insights_context(items) -> str:
                 rate_str = f", win rate {rate:.0%}" if rate is not None else ""
                 lines.append(f"  - {e} (n={total_e}): {fav} favorable, {unfav} unfavorable{rate_str}")
 
-    # Emotion x scenario crosstab — cells with n >= 2 only, so we don't
-    # tempt the LLM to generalize from a single decision.
+    # Emotion x decision-type crosstab — cells with n >= 2 only.
     if emotion_counts:
         es_cells: dict[tuple[str, str], dict[str, int]] = {}
         for it in items:
             if not it.emotion:
                 continue
-            key = (it.emotion.value, it.scenario_type.value)
-            outcome = it.outcome.value if it.outcome else "missing"
+            key = (emotion_label(it), scenario_label(it))
+            outcome = outcome_label(it) or "missing"
             es_cells.setdefault(key, {})[outcome] = es_cells.get(key, {}).get(outcome, 0) + 1
 
         meaningful_cells = [
             (k, v) for k, v in es_cells.items() if sum(v.values()) >= 2
         ]
         if meaningful_cells:
-            lines.append("\nEmotion x scenario crosstab (cells with n >= 2 only):")
+            lines.append("\nEmotion x decision-type crosstab (cells with n >= 2 only):")
             for (emo, sc), counts in sorted(meaningful_cells, key=lambda x: -sum(x[1].values())):
                 total_cell = sum(counts.values())
                 fav = counts.get("favorable", 0)
@@ -1052,7 +1060,7 @@ def format_insights_context(items) -> str:
         for t, c in top_tickers:
             t_outcomes = _count_dict(
                 [it for it in items if it.ticker == t],
-                lambda it: it.outcome.value if it.outcome else None,
+                outcome_label,
             )
             fav = t_outcomes.get("favorable", 0)
             unfav = t_outcomes.get("unfavorable", 0)
@@ -1061,13 +1069,15 @@ def format_insights_context(items) -> str:
                 f"  - {t}: {c} decisions ({fav} favorable, {unfav} unfavorable, {neutral} neutral)"
             )
 
-    # Recent streak of outcomes (most-recent-first)
-    recent = [it.outcome.value for it in items[:5] if it.outcome]
-    if recent:
-        lines.append(
-            f"\nMost recent 5 outcomes (newest first, i.e. items[0] is the latest decision): "
-            f"{', '.join(recent)}"
-        )
+    # Recent outcomes with explicit indices so the LLM can't muddle ordering.
+    # Previous freeform comma-list caused "the last 2 are unfavorable" style
+    # misreads on data where the latest item was actually a single unfavorable.
+    recent_items = [it for it in items[:5] if it.outcome]
+    if recent_items:
+        lines.append("\nMost recent decisions (latest first):")
+        for idx, it in enumerate(recent_items, 1):
+            label = "latest" if idx == 1 else f"#{idx} from latest"
+            lines.append(f"  - {label}: {outcome_label(it)} ({it.ticker} {scenario_label(it)})")
 
     # First-half vs second-half by created_at. items[0] is the newest in our
     # sort order, so the FIRST half of the user's journey is items[-N//2:]
@@ -1078,7 +1088,7 @@ def format_insights_context(items) -> str:
         second_half = items[:mid]  # newest entries (recent)
 
         def half_stats(group):
-            o_counts = _count_dict(group, lambda it: it.outcome.value if it.outcome else None)
+            o_counts = _count_dict(group, outcome_label)
             fav = o_counts.get("favorable", 0)
             unfav = o_counts.get("unfavorable", 0)
             neutral = o_counts.get("neutral", 0)
@@ -1095,23 +1105,47 @@ def format_insights_context(items) -> str:
             f"\n  - Latest {len(second_half)}: {s_fav} favorable, {s_unfav} unfavorable, {s_neutral} neutral (win rate {s_rate_str})"
         )
 
-    # Specific high-regret spotlight — top 3 by |diff_percent|. Concrete,
-    # nameable, hard to abstract away. Each line gives the model enough
-    # context (ticker, date, scenario, magnitude) to write a specific
-    # observation around it.
+    # Specific high-regret spotlight — top 3 by |diff_percent|, with the
+    # opportunity-cost dollar amount computed where size data is present.
+    # Concrete numbers turn "X rose 145%" into "you'd be looking at ~$2,800
+    # more / less" — much harder to abstract away.
     regret_items = [it for it in items if it.current and it.current.diff_percent is not None]
     if regret_items:
         regret_items_sorted = sorted(
             regret_items, key=lambda it: abs(it.current.diff_percent), reverse=True
         )[:3]
-        lines.append("\nTop 3 decisions by absolute price change (regret spotlight):")
+        lines.append(
+            "\nTop 3 decisions by absolute price change (regret spotlight, with "
+            "approximate dollar impact when position size is known):"
+        )
         for rank, it in enumerate(regret_items_sorted, 1):
-            emo = it.emotion.value if it.emotion else "no emotion logged"
-            outcome = it.outcome.value if it.outcome else "no outcome"
-            direction = it.direction.value if it.direction else "no direction"
+            emo = emotion_label(it) or "no emotion logged"
+            outc = outcome_label(it) or "no outcome"
+            direction = direction_label(it) or "no result description"
+
+            # Approximate opportunity cost. Prefer quantity*decision_price as
+            # the position basis; fall back to the user-entered amount. Sign
+            # follows diff_percent so the model can phrase it as gain or loss.
+            decision_price = it.current.decision_price if it.current else None
+            position_basis: Optional[float] = None
+            if it.quantity is not None and decision_price:
+                position_basis = float(it.quantity) * float(decision_price)
+            elif it.amount is not None:
+                position_basis = float(it.amount)
+
+            dollar_str = ""
+            if position_basis is not None:
+                dollar_impact = position_basis * (it.current.diff_percent / 100.0)
+                sign = "+" if dollar_impact >= 0 else "-"
+                dollar_str = (
+                    f", ~{sign}${abs(dollar_impact):,.0f} on a position basis of "
+                    f"${position_basis:,.0f}"
+                )
+
             lines.append(
-                f"  - #{rank} {it.ticker} {it.scenario_type.value} on {it.decision_date.isoformat()}: "
-                f"{it.current.diff_percent:+.2f}% since ({direction}, {outcome}, felt {emo})"
+                f"  - #{rank} {it.ticker} ({scenario_label(it)}) on {it.decision_date.isoformat()}: "
+                f"{it.current.diff_percent:+.2f}% since{dollar_str} "
+                f"({direction}, {outc}, felt {emo})"
             )
 
     # Average diff_percent — give LLM a single-number magnitude sense
@@ -1207,7 +1241,7 @@ def generate_insights(items) -> InsightsResult:
 
         forbidden_hit: Optional[str] = None
         for ins in cleaned:
-            hit = _has_forbidden_insight(ins)
+            hit = _has_forbidden(ins)
             if hit:
                 forbidden_hit = hit
                 logger.info("Insight tripped guardrail (%r): %s", hit, ins)
