@@ -784,3 +784,293 @@ def generate_reflection(req: ReflectRequest) -> ReflectResponse:
         degraded=True,
         attempts=REFLECT_MAX_ATTEMPTS,
     )
+
+
+# ==========================================================================
+# Pattern-level insights (F-06) — multi-decision behavioral observations
+# ==========================================================================
+
+from dataclasses import dataclass
+
+INSIGHTS_MODEL = REFLECT_MODEL  # Sonnet 4.6 — same tone calibration as /reflect
+INSIGHTS_MAX_TOKENS = 800
+INSIGHTS_MAX_ATTEMPTS = 3
+INSIGHTS_MIN_COUNT = 3
+INSIGHTS_MAX_COUNT = 5
+
+
+@dataclass
+class InsightsResult:
+    """Internal return type for generate_insights — the pattern service wraps
+    this with cache + timestamp metadata before returning to the API layer."""
+    insights: list[str]
+    degraded: bool
+
+
+INSIGHTS_SYSTEM_PROMPT = """You are analyzing a personal investor's full decision history for If-Vest to surface observational patterns.
+
+Your job: read the aggregated stats in the user message and call the `report_insights` tool with 3-5 one-sentence behavioral observations.
+
+## Rules
+- Observe, never advise. No "you should..." sentences, no imperatives.
+- Every insight must reference SPECIFIC numbers from the stats. Vague claims like "you're improving" are not insights.
+- No predictions about future market moves or individual stock prices.
+- No stock recommendations or strategy suggestions.
+- Neutral, factual tone. A quiet analyst's voice, not a coach's.
+- If a stat category has under 3 entries, don't generalize from it.
+
+## Good insights (write like these)
+- "Of your 12 logged decisions, 7 were no_buy; 5 of those 7 turned unfavorable — hesitation around eventually-rising names is your dominant pattern so far."
+- "Decisions logged while anxious have a 25% favorable rate (1 of 4), versus 80% (4 of 5) when confident."
+- "NVDA appears in 5 of your 12 decisions — heavier single-ticker concentration than any other name in your record."
+- "Your last 4 outcomes are unfavorable, the longest such streak in your logged history."
+
+## Bad insights (NEVER write these)
+- "You should diversify more." (advice)
+- "NVDA is likely to keep rising." (prediction)
+- "Your decision-making has improved." (vague, no number)
+- "Consider sitting out of volatile stocks." (advice)
+
+## Output language
+The input uses internal terms like `no_buy`, `no_sell`, `sold_too_early`, `missed_gain`, `favorable`, etc. Your OUTPUT may use the scenario types (`no_buy`, `no_sell`, `sold_too_early`) verbatim since users see those labels on their decisions. Translate the rest to plain English (e.g., "favorable outcome" stays as "favorable", "missed_gain" becomes "missing a gain").
+
+## STRICT prohibitions
+- No "should", "shouldn't", "must", "need to", "ought to", "next time", "going forward"
+- No "recommend", "suggest", "advise"
+- No "will rise/fall/drop/jump", "likely to", "expected to", "going to"
+- No "diversify", "rebalance", "take profits", "stop-loss", "hold longer"
+- No emojis, no exclamation marks
+- No code-leaked enums beyond the scenario_type names (no `missed_gain`, `avoided_loss`, `direction`, `diff_percent` in your output)
+
+## Tone
+- Plain observational. 1 sentence per insight. Compact. Each insight stands alone.
+- Order from most striking to supporting.
+
+## Output rules
+- Always call `report_insights`. Never respond in plain text.
+- Return 3-5 insights. If you can only find 3 honest, data-anchored observations, return 3 — never pad.
+"""
+
+
+INSIGHTS_TOOL: dict[str, Any] = {
+    "name": "report_insights",
+    "description": (
+        "Return 3-5 one-sentence behavioral observations from the user's decision history. "
+        "Each must reference specific numbers from the input stats."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "insights": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": INSIGHTS_MIN_COUNT,
+                "maxItems": INSIGHTS_MAX_COUNT,
+                "description": "Each item is one self-contained observation, 1 sentence.",
+            }
+        },
+        "required": ["insights"],
+    },
+}
+
+
+def _count_dict(items, key_fn) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for it in items:
+        k = key_fn(it)
+        if k is None:
+            continue
+        out[k] = out.get(k, 0) + 1
+    return out
+
+
+def format_insights_context(items) -> str:
+    """Format decision history as natural-language stats for the LLM.
+
+    `items` is a list of DecisionWithCurrent (most-recent-first by created_at,
+    per get_user_decisions' default sort). Imported lazily to avoid circular
+    imports — pattern_service imports llm_service, not the other way around.
+    """
+    total = len(items)
+    lines = [f"Total logged decisions: {total}"]
+
+    scenario_counts = _count_dict(items, lambda it: it.scenario_type.value)
+    outcome_counts = _count_dict(items, lambda it: it.outcome.value if it.outcome else None)
+    emotion_counts = _count_dict(items, lambda it: it.emotion.value if it.emotion else None)
+    direction_counts = _count_dict(items, lambda it: it.direction.value if it.direction else None)
+
+    lines.append("\nScenario distribution:")
+    for s, c in sorted(scenario_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"  - {s}: {c}")
+
+    lines.append("\nOutcome distribution:")
+    for o, c in sorted(outcome_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"  - {o}: {c}")
+
+    lines.append("\nDirection distribution:")
+    for d, c in sorted(direction_counts.items(), key=lambda x: -x[1]):
+        lines.append(f"  - {d}: {c}")
+
+    if emotion_counts:
+        lines.append("\nEmotion at decision time:")
+        for e, c in sorted(emotion_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  - {e}: {c}")
+    else:
+        lines.append("\nEmotion at decision time: not logged for any decision yet.")
+
+    # Scenario × outcome
+    scenario_outcome: dict[str, dict[str, int]] = {}
+    for it in items:
+        if not it.outcome:
+            continue
+        s_key = it.scenario_type.value
+        o_key = it.outcome.value
+        scenario_outcome.setdefault(s_key, {})[o_key] = (
+            scenario_outcome.get(s_key, {}).get(o_key, 0) + 1
+        )
+    if scenario_outcome:
+        lines.append("\nScenario x outcome breakdown:")
+        for s, counts in scenario_outcome.items():
+            total_s = sum(counts.values())
+            fav = counts.get("favorable", 0)
+            unfav = counts.get("unfavorable", 0)
+            neutral = counts.get("neutral", 0)
+            lines.append(
+                f"  - {s} (n={total_s}): {fav} favorable, {unfav} unfavorable, {neutral} neutral"
+            )
+
+    # Emotion × outcome
+    if emotion_counts:
+        emotion_outcome: dict[str, dict[str, int]] = {}
+        for it in items:
+            if not it.emotion or not it.outcome:
+                continue
+            e_key = it.emotion.value
+            o_key = it.outcome.value
+            emotion_outcome.setdefault(e_key, {})[o_key] = (
+                emotion_outcome.get(e_key, {}).get(o_key, 0) + 1
+            )
+        if emotion_outcome:
+            lines.append("\nEmotion x outcome breakdown (only emotions logged):")
+            for e, counts in emotion_outcome.items():
+                total_e = sum(counts.values())
+                fav = counts.get("favorable", 0)
+                unfav = counts.get("unfavorable", 0)
+                lines.append(f"  - {e} (n={total_e}): {fav} favorable, {unfav} unfavorable")
+
+    # Top tickers (top 5 by frequency)
+    ticker_counts = _count_dict(items, lambda it: it.ticker)
+    top_tickers = sorted(ticker_counts.items(), key=lambda x: -x[1])[:5]
+    if top_tickers and top_tickers[0][1] >= 2:
+        lines.append("\nMost frequent tickers (top 5 by count):")
+        for t, c in top_tickers:
+            lines.append(f"  - {t}: {c}")
+
+    # Recent streak of outcomes (most-recent-first)
+    recent = [it.outcome.value for it in items[:5] if it.outcome]
+    if recent:
+        lines.append(f"\nMost recent outcomes (newest first, up to 5): {', '.join(recent)}")
+
+    # Average diff_percent — give LLM a single-number magnitude sense
+    diffs = [it.current.diff_percent for it in items if it.current]
+    if diffs:
+        avg_diff = sum(diffs) / len(diffs)
+        lines.append(f"\nAverage price change since decision across all: {avg_diff:+.2f}%")
+
+    return "\n".join(lines)
+
+
+def generate_insights(items) -> InsightsResult:
+    """Generate 3-5 behavioral insights via LLM. Retries on guardrail violations
+    or under-count responses. Returns degraded=True with empty insights when
+    all attempts fail.
+
+    Caller is responsible for verifying len(items) >= 10 before invoking.
+    """
+    client = _get_client()
+    user_message = format_insights_context(items)
+
+    for attempt in range(1, INSIGHTS_MAX_ATTEMPTS + 1):
+        try:
+            response = client.messages.create(
+                model=INSIGHTS_MODEL,
+                max_tokens=INSIGHTS_MAX_TOKENS,
+                system=[
+                    {
+                        "type": "text",
+                        "text": INSIGHTS_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                tools=[INSIGHTS_TOOL],
+                tool_choice={"type": "tool", "name": "report_insights"},
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except anthropic.RateLimitError:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "code": "RATE_LIMITED",
+                        "message": "LLM provider rate limit hit. Try again in a moment.",
+                    }
+                },
+            )
+        except anthropic.AuthenticationError:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error": {
+                        "code": "INVALID_API_KEY",
+                        "message": "Server LLM authentication failed.",
+                    }
+                },
+            )
+        except anthropic.APIError as exc:
+            logger.warning("Anthropic API error during insights: %s", exc)
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "error": {
+                        "code": "LLM_PROVIDER_ERROR",
+                        "message": str(exc),
+                    }
+                },
+            )
+
+        tool_use_block = next(
+            (b for b in response.content if b.type == "tool_use"),
+            None,
+        )
+        if tool_use_block is None:
+            logger.warning("Insights attempt %d returned no tool_use block", attempt)
+            continue
+
+        raw_insights = tool_use_block.input.get("insights") or []
+        if not isinstance(raw_insights, list) or len(raw_insights) < INSIGHTS_MIN_COUNT:
+            logger.warning(
+                "Insights attempt %d returned %d items (need >= %d)",
+                attempt,
+                len(raw_insights) if isinstance(raw_insights, list) else 0,
+                INSIGHTS_MIN_COUNT,
+            )
+            continue
+
+        # Drop empty strings, then guardrail-check the survivors.
+        cleaned = [str(s).strip() for s in raw_insights if str(s).strip()]
+        if len(cleaned) < INSIGHTS_MIN_COUNT:
+            logger.warning("Insights attempt %d had only %d non-empty entries", attempt, len(cleaned))
+            continue
+
+        forbidden_hit: Optional[str] = None
+        for ins in cleaned:
+            hit = _has_forbidden(ins)
+            if hit:
+                forbidden_hit = hit
+                logger.info("Insight tripped guardrail (%r): %s", hit, ins)
+                break
+
+        if forbidden_hit is None:
+            return InsightsResult(insights=cleaned[:INSIGHTS_MAX_COUNT], degraded=False)
+
+    return InsightsResult(insights=[], degraded=True)
