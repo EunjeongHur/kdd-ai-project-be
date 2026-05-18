@@ -218,6 +218,81 @@ def update_decision_reflection(
     return Decision.model_validate(res.data[0])
 
 
+def get_decision_by_id(user_id: str, decision_id: UUID) -> DecisionWithCurrent:
+    """Fetch one decision with freshly-recomputed current values.
+
+    Used by GET /decisions/{id}. Mirrors get_user_decisions for a single row.
+    """
+    client = get_supabase()
+    res = (
+        client.table("decisions")
+        .select("*")
+        .eq("id", str(decision_id))
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "code": "DECISION_NOT_FOUND",
+                    "message": "Decision not found or unauthorized.",
+                }
+            },
+        )
+
+    decision = Decision.model_validate(res.data[0])
+
+    try:
+        market = get_market_data(decision.ticker, decision.decision_date)
+        diff_amt, diff_pct, d_price, source = compute_diffs(
+            decision_price_yf=market.decision_price,
+            current_price=market.current_price,
+            quantity=decision.quantity,
+            amount=decision.amount,
+        )
+        dir_val = derive_direction(decision.scenario_type, diff_pct)
+        out_val = derive_outcome(dir_val)
+        corr_val = derive_was_correct(out_val)
+        current_calc = CalculateResponse(
+            ticker=decision.ticker,
+            scenario_type=decision.scenario_type,
+            decision_date=decision.decision_date,
+            actual_date_used=market.actual_date_used,
+            decision_price=round(d_price, 4),
+            decision_price_source=source,
+            current_price=round(market.current_price, 4),
+            current_date=market.current_date,
+            diff_amount=round(diff_amt, 2),
+            diff_percent=round(diff_pct, 2),
+            direction=dir_val,
+            outcome=out_val,
+            was_decision_correct=corr_val,
+            split_adjusted=True,
+        )
+    except Exception:
+        current_calc = CalculateResponse(
+            ticker=decision.ticker,
+            scenario_type=decision.scenario_type,
+            decision_date=decision.decision_date,
+            actual_date_used=decision.actual_date_used,
+            decision_price=decision.decision_price_snapshot,
+            decision_price_source=decision.decision_price_source,
+            current_price=decision.current_price or decision.decision_price_snapshot,
+            current_date=decision.current_date_snapshot or decision.actual_date_used,
+            diff_amount=decision.diff_amount or 0.0,
+            diff_percent=decision.diff_percent or 0.0,
+            direction=decision.direction,
+            outcome=decision.outcome,
+            was_decision_correct=decision.was_decision_correct,
+            split_adjusted=True,
+        )
+
+    return DecisionWithCurrent(**decision.model_dump(), current=current_calc)
+
+
 def delete_decision(user_id: str, decision_id: UUID) -> None:
     """Delete a user decision by ID."""
     client = get_supabase()
