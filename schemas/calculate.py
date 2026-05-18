@@ -108,3 +108,30 @@ class CalculateResponse(BaseModel):
         description="True if outcome favorable, False if unfavorable, null if neutral.",
     )
     split_adjusted: bool = Field(True, description="Always true (yfinance Adjusted Close).")
+
+class OptimalTimingRequest(BaseModel):
+    """Request body for POST /optimal-timing (F-02)."""
+    ticker: str = Field(..., examples=["AAPL"], description="Uppercase US ticker.")
+    start_date: date = Field(..., description="Start date of the scan window.")
+    end_date: date = Field(..., description="End date of the scan window.")
+
+
+class OptimalPoint(BaseModel):
+    """A single price point and its date."""
+    date: date
+    price: float
+
+
+class OptimalTimingResponse(BaseModel):
+    """Response from POST /optimal-timing."""
+    ticker: str
+    best_buy: OptimalPoint
+    best_sell: OptimalPoint
+    max_swing_percent: Optional[float] = Field(
+        None,
+        description="((best_sell.price - best_buy.price) / best_buy.price) * 100, only when best_buy.date < best_sell.date."
+    )
+    summary_message: Optional[str] = Field(
+        None,
+        description="Factual summary message, e.g. '이 구간 내 최고가는 +38.4% 시점이었습니다'."
+    )
