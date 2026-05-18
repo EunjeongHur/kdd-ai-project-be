@@ -2,11 +2,14 @@
 
 Handles Supabase DB operations, 50-cap limit check, and real-time calculation.
 """
+import logging
 from datetime import date
 from typing import Optional
 from uuid import UUID
 
 from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 
 from schemas.calculate import (
     CalculateResponse,
@@ -20,6 +23,12 @@ from services.supabase_service import get_supabase
 from services.yfinance_service import get_market_data
 
 
+# Soft cap on how many decisions a user can keep at once. When at or above
+# this many, save_decision FIFO-evicts the oldest entry so the new one fits.
+# Treat as a rolling 50-decision window rather than a hard wall.
+DECISION_CAP = 50
+
+
 def get_user_decision_count(user_id: str) -> int:
     """Get the exact count of decisions for a user."""
     client = get_supabase()
@@ -27,19 +36,55 @@ def get_user_decision_count(user_id: str) -> int:
     return res.count if res.count is not None else len(res.data)
 
 
+def _evict_oldest_decision(client, user_id: str) -> Optional[dict]:
+    """Delete the user's oldest decision by created_at. Returns the deleted
+    row dict (for logging) or None if nothing was found / nothing deleted."""
+    oldest = (
+        client.table("decisions")
+        .select("id, ticker, decision_date, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+    if not oldest.data:
+        return None
+    oldest_id = oldest.data[0]["id"]
+    deleted = (
+        client.table("decisions")
+        .delete()
+        .eq("id", oldest_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    return deleted.data[0] if deleted.data else None
+
+
 def save_decision(user_id: str, input_data: DecisionInput) -> Decision:
-    """Save a decision for a user after verifying cap limit and computing snapshot."""
+    """Save a decision, FIFO-evicting the oldest one if the user is at cap.
+
+    Treats DECISION_CAP as a rolling window: instead of refusing the 51st
+    insert with 409, drop the oldest entry to make room. Loops while >= cap
+    in case some out-of-band write pushed the user past the limit; in normal
+    flow this evicts exactly one row.
+    """
+    client = get_supabase()
     count = get_user_decision_count(user_id)
-    if count >= 50:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": {
-                    "code": "DECISION_LIMIT_REACHED",
-                    "message": "Decision history limit (50) reached. Please delete old decisions.",
-                }
-            },
+    while count >= DECISION_CAP:
+        evicted = _evict_oldest_decision(client, user_id)
+        if evicted is None:
+            # Couldn't find / delete anything — break to avoid an infinite loop
+            # and let the next checks proceed; insert will surface the real error.
+            logger.warning("FIFO evict could not delete a row for user %s", user_id)
+            break
+        logger.info(
+            "FIFO-evicted oldest decision for user %s: id=%s ticker=%s decision_date=%s",
+            user_id,
+            evicted.get("id"),
+            evicted.get("ticker"),
+            evicted.get("decision_date"),
         )
+        count -= 1
 
     # Fetch market data
     ticker = input_data.ticker.strip().upper()
