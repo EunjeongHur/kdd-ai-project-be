@@ -18,6 +18,7 @@ from routers.calculate import router as calculate_router
 from routers.parse_decision import router as parse_decision_router
 from routers.reflect import router as reflect_router
 from routers.tickers import router as tickers_router
+from routers.price_history import router as price_history_router
 
 
 APP_VERSION = "0.2.0"
@@ -91,6 +92,7 @@ app.include_router(calculate_router)
 app.include_router(parse_decision_router)
 app.include_router(reflect_router)
 app.include_router(tickers_router)
+app.include_router(price_history_router)
 
 class HealthResponse(BaseModel):
     status: str
