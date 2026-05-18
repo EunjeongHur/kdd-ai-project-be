@@ -634,6 +634,29 @@ def _has_forbidden(text: str) -> Optional[str]:
     return None
 
 
+# F-06 insights talk about decision history at the aggregate level. Users see
+# scenario labels like "No Buy" on every card, so the LLM saying "your no_buy
+# decisions..." is correct usage, not an internal-string leak. Direction
+# values (missed_gain, avoided_loss, etc.) are still hidden — those are
+# computed states the user never sees as a label.
+_INSIGHTS_FORBIDDEN_PATTERNS = [
+    p
+    for p in _FORBIDDEN_PATTERNS
+    if p.pattern != r"\b(?:no_buy|no_sell|sold_too_early)\b"
+]
+
+
+def _has_forbidden_insight(text: str) -> Optional[str]:
+    """Guardrail check for /patterns/insights output. Looser than /reflect's
+    check: permits the scenario-type enum strings since those double as the
+    user-facing label."""
+    for pattern in _INSIGHTS_FORBIDDEN_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return match.group(0)
+    return None
+
+
 # Natural-language translations of internal enum values. We feed these to the
 # model instead of raw enum strings so it never echoes "no_buy" or
 # "missed_gain" verbatim in the output.
@@ -1064,7 +1087,7 @@ def generate_insights(items) -> InsightsResult:
 
         forbidden_hit: Optional[str] = None
         for ins in cleaned:
-            hit = _has_forbidden(ins)
+            hit = _has_forbidden_insight(ins)
             if hit:
                 forbidden_hit = hit
                 logger.info("Insight tripped guardrail (%r): %s", hit, ins)
