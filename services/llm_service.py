@@ -832,46 +832,64 @@ class InsightsResult:
 
 INSIGHTS_SYSTEM_PROMPT = """You are analyzing a personal investor's full decision history for If-Vest to surface observational patterns.
 
-Your job: read the aggregated stats in the user message and call the `report_insights` tool with 3-5 one-sentence behavioral observations.
+Your job: read the aggregated stats in the user message and call the `report_insights` tool with 3-5 one-sentence behavioral observations the user could not have seen at a glance from a single chart.
 
-## Rules
-- Observe, never advise. No "you should..." sentences, no imperatives.
-- Every insight must reference SPECIFIC numbers from the stats. Vague claims like "you're improving" are not insights.
-- No predictions about future market moves or individual stock prices.
-- No stock recommendations or strategy suggestions.
-- Neutral, factual tone. A quiet analyst's voice, not a coach's.
-- If a stat category has under 3 entries, don't generalize from it.
+## What counts as an insight
 
-## Good insights (write like these)
-- "Of your 12 logged decisions, 7 were no_buy; 5 of those 7 turned unfavorable — hesitation around eventually-rising names is your dominant pattern so far."
-- "Decisions logged while anxious have a 25% favorable rate (1 of 4), versus 80% (4 of 5) when confident."
-- "NVDA appears in 5 of your 12 decisions — heavier single-ticker concentration than any other name in your record."
-- "Your last 4 outcomes are unfavorable, the longest such streak in your logged history."
+An insight earns its place by doing ONE of the following:
 
-## Bad insights (NEVER write these)
-- "You should diversify more." (advice)
-- "NVDA is likely to keep rising." (prediction)
-- "Your decision-making has improved." (vague, no number)
-- "Consider sitting out of volatile stocks." (advice)
+1. **Cross-cut two or more dimensions** — show how a stat *interacts* with another, not just its value.
+   Example: "When confident on no_sell, your win rate is 100% (2 of 2); when confident on no_buy, it drops to 33%." Two dimensions: emotion x scenario.
 
-## Output language
-The input uses internal terms like `no_buy`, `no_sell`, `sold_too_early`, `missed_gain`, `favorable`, etc. Your OUTPUT may use the scenario types (`no_buy`, `no_sell`, `sold_too_early`) verbatim since users see those labels on their decisions. Translate the rest to plain English (e.g., "favorable outcome" stays as "favorable", "missed_gain" becomes "missing a gain").
+2. **Spotlight a specific named decision** — use the regret spotlight in the input. Reference ticker + date + magnitude.
+   Example: "Your largest miss is GOOGL sold March 2025 at $164; it has since reached $401 (+145%) — your single biggest opportunity cost in the record."
 
-## STRICT prohibitions
-- No "should", "shouldn't", "must", "need to", "ought to", "next time", "going forward"
-- No "recommend", "suggest", "advise"
-- No "will rise/fall/drop/jump", "likely to", "expected to", "going to"
-- No "diversify", "rebalance", "take profits", "stop-loss", "hold longer"
-- No emojis, no exclamation marks
-- No code-leaked enums beyond the scenario_type names (no `missed_gain`, `avoided_loss`, `direction`, `diff_percent` in your output)
+3. **Compare time periods** — use the first-half vs second-half split provided.
+   Example: "Your win rate has dropped from 50% in your earliest 8 decisions to 25% in your most recent 8."
 
-## Tone
-- Plain observational. 1 sentence per insight. Compact. Each insight stands alone.
-- Order from most striking to supporting.
+4. **Identify a streak or change of behavior** — only when it spans 3+ entries.
+   Example: "Your last 4 outcomes are all unfavorable — the longest such streak in the record."
+
+5. **Counter-intuitive observation** — flag a stat that contradicts what someone might assume.
+   Example: "Despite logging confident on 4 decisions, only 50% turned favorable — confidence is not predicting outcome here."
+
+## NARRATION IS NOT INSIGHT
+
+The single biggest failure mode is rephrasing one row of the input. If your sentence is a paraphrase of a single line in the stats block, it's narration, not insight. DROP IT and find a real cross-cut.
+
+### Examples of narration (NEVER write these — they restate input)
+- "NVDA appears in 9 of 16 logged decisions." → narration, that's literally a line in the stats
+- "All 3 sold_too_early decisions were unfavorable." → narration, also a stats line
+- "no_buy is the dominant scenario at 8 of 16, with 6 unfavorable." → narration, that's the scenario x outcome row
+
+### Same data, rewritten as insight (cross-cut, contrast, spotlight)
+- "NVDA accounts for 9 of your 16 decisions but produced 5 unfavorable outcomes — your high-concentration name is also your highest-miss name."
+- "Every sold_too_early decision was unfavorable (3 of 3), while no_sell was your only scenario without an unfavorable result — opposite outcomes from opposite restraints."
+- "Your no_buy decisions are 75% unfavorable when felt anxious (3 of 4) but improve to a single unfavorable when confident — emotion correlates more than scenario here."
+
+## Tone & language
+
+- Plain observational. 1 sentence per insight.
+- Reference SPECIFIC numbers — counts, rates, dates, ticker names.
+- The scenario type strings (`no_buy`, `no_sell`, `sold_too_early`) ARE the user-facing labels — use them verbatim.
+- Translate other internal enums to plain English ("missed_gain" → "missing a gain", "cut_short_gain" → "selling before further upside").
+- Neutral analyst voice. Not a coach. Not a friend.
+
+## Hard prohibitions
+
+- No advice: "should", "shouldn't", "must", "need to", "consider", "next time", "going forward".
+- No prediction: "will rise/fall", "likely to", "expected to", "going to".
+- No strategy verbs: "diversify", "rebalance", "take profits", "stop-loss", "hold longer".
+- No "recommend", "suggest", "advise".
+- No leaked internal enums beyond scenario_type (no `missed_gain`, `direction`, `diff_percent` as words in your output).
+- No emojis, no exclamation marks.
+- No generalization from any cell with under 3 entries. If emotion=cautious has n=2, you may NOT say "cautious decisions tend to..."
 
 ## Output rules
-- Always call `report_insights`. Never respond in plain text.
-- Return 3-5 insights. If you can only find 3 honest, data-anchored observations, return 3 — never pad.
+
+- ALWAYS call `report_insights`. No plain text.
+- Return 3-5 insights. Drop any narration-style sentence even if it leaves you with only 3.
+- Order: most striking cross-cut or spotlight first.
 """
 
 
@@ -907,12 +925,27 @@ def _count_dict(items, key_fn) -> dict[str, int]:
     return out
 
 
-def format_insights_context(items) -> str:
-    """Format decision history as natural-language stats for the LLM.
+def _favorable_rate(counts: dict[str, int]) -> Optional[float]:
+    """Favorable / (favorable + unfavorable). Returns None when neither
+    category has entries — avoids the zero-denominator footgun and signals
+    'not measurable' to the prompt formatter."""
+    fav = counts.get("favorable", 0)
+    unfav = counts.get("unfavorable", 0)
+    denom = fav + unfav
+    return (fav / denom) if denom > 0 else None
 
-    `items` is a list of DecisionWithCurrent (most-recent-first by created_at,
-    per get_user_decisions' default sort). Imported lazily to avoid circular
-    imports — pattern_service imports llm_service, not the other way around.
+
+def format_insights_context(items) -> str:
+    """Format decision history as a brief for the LLM.
+
+    Goes beyond per-dimension counts: surfaces cross-dimension cells
+    (emotion x scenario), time splits (first half vs second half by
+    created_at), and named high-regret decisions. The point is to give
+    the model something to *compare* — narration-style insights happen
+    when only single-axis stats are present.
+
+    `items` is a list of DecisionWithCurrent (most-recent-first by
+    created_at, per get_user_decisions' default sort).
     """
     total = len(items)
     lines = [f"Total logged decisions: {total}"]
@@ -958,11 +991,13 @@ def format_insights_context(items) -> str:
             fav = counts.get("favorable", 0)
             unfav = counts.get("unfavorable", 0)
             neutral = counts.get("neutral", 0)
+            rate = _favorable_rate(counts)
+            rate_str = f", win rate {rate:.0%}" if rate is not None else ""
             lines.append(
-                f"  - {s} (n={total_s}): {fav} favorable, {unfav} unfavorable, {neutral} neutral"
+                f"  - {s} (n={total_s}): {fav} favorable, {unfav} unfavorable, {neutral} neutral{rate_str}"
             )
 
-    # Emotion × outcome
+    # Emotion × outcome (only emotions with entries)
     if emotion_counts:
         emotion_outcome: dict[str, dict[str, int]] = {}
         for it in items:
@@ -974,25 +1009,110 @@ def format_insights_context(items) -> str:
                 emotion_outcome.get(e_key, {}).get(o_key, 0) + 1
             )
         if emotion_outcome:
-            lines.append("\nEmotion x outcome breakdown (only emotions logged):")
+            lines.append("\nEmotion x outcome breakdown:")
             for e, counts in emotion_outcome.items():
                 total_e = sum(counts.values())
                 fav = counts.get("favorable", 0)
                 unfav = counts.get("unfavorable", 0)
-                lines.append(f"  - {e} (n={total_e}): {fav} favorable, {unfav} unfavorable")
+                rate = _favorable_rate(counts)
+                rate_str = f", win rate {rate:.0%}" if rate is not None else ""
+                lines.append(f"  - {e} (n={total_e}): {fav} favorable, {unfav} unfavorable{rate_str}")
+
+    # Emotion x scenario crosstab — cells with n >= 2 only, so we don't
+    # tempt the LLM to generalize from a single decision.
+    if emotion_counts:
+        es_cells: dict[tuple[str, str], dict[str, int]] = {}
+        for it in items:
+            if not it.emotion:
+                continue
+            key = (it.emotion.value, it.scenario_type.value)
+            outcome = it.outcome.value if it.outcome else "missing"
+            es_cells.setdefault(key, {})[outcome] = es_cells.get(key, {}).get(outcome, 0) + 1
+
+        meaningful_cells = [
+            (k, v) for k, v in es_cells.items() if sum(v.values()) >= 2
+        ]
+        if meaningful_cells:
+            lines.append("\nEmotion x scenario crosstab (cells with n >= 2 only):")
+            for (emo, sc), counts in sorted(meaningful_cells, key=lambda x: -sum(x[1].values())):
+                total_cell = sum(counts.values())
+                fav = counts.get("favorable", 0)
+                unfav = counts.get("unfavorable", 0)
+                rate = _favorable_rate(counts)
+                rate_str = f", win rate {rate:.0%}" if rate is not None else ""
+                lines.append(
+                    f"  - {emo} + {sc} (n={total_cell}): {fav} favorable, {unfav} unfavorable{rate_str}"
+                )
 
     # Top tickers (top 5 by frequency)
     ticker_counts = _count_dict(items, lambda it: it.ticker)
     top_tickers = sorted(ticker_counts.items(), key=lambda x: -x[1])[:5]
     if top_tickers and top_tickers[0][1] >= 2:
-        lines.append("\nMost frequent tickers (top 5 by count):")
+        lines.append("\nMost frequent tickers (top 5 by count, paired with their outcomes):")
         for t, c in top_tickers:
-            lines.append(f"  - {t}: {c}")
+            t_outcomes = _count_dict(
+                [it for it in items if it.ticker == t],
+                lambda it: it.outcome.value if it.outcome else None,
+            )
+            fav = t_outcomes.get("favorable", 0)
+            unfav = t_outcomes.get("unfavorable", 0)
+            neutral = t_outcomes.get("neutral", 0)
+            lines.append(
+                f"  - {t}: {c} decisions ({fav} favorable, {unfav} unfavorable, {neutral} neutral)"
+            )
 
     # Recent streak of outcomes (most-recent-first)
     recent = [it.outcome.value for it in items[:5] if it.outcome]
     if recent:
-        lines.append(f"\nMost recent outcomes (newest first, up to 5): {', '.join(recent)}")
+        lines.append(
+            f"\nMost recent 5 outcomes (newest first, i.e. items[0] is the latest decision): "
+            f"{', '.join(recent)}"
+        )
+
+    # First-half vs second-half by created_at. items[0] is the newest in our
+    # sort order, so the FIRST half of the user's journey is items[-N//2:]
+    # (the OLDEST entries), and the SECOND half is items[:N//2].
+    if total >= 4:
+        mid = total // 2
+        first_half = items[-mid:]  # oldest entries (early in user's journey)
+        second_half = items[:mid]  # newest entries (recent)
+
+        def half_stats(group):
+            o_counts = _count_dict(group, lambda it: it.outcome.value if it.outcome else None)
+            fav = o_counts.get("favorable", 0)
+            unfav = o_counts.get("unfavorable", 0)
+            neutral = o_counts.get("neutral", 0)
+            rate = _favorable_rate(o_counts)
+            return fav, unfav, neutral, rate
+
+        f_fav, f_unfav, f_neutral, f_rate = half_stats(first_half)
+        s_fav, s_unfav, s_neutral, s_rate = half_stats(second_half)
+        f_rate_str = f"{f_rate:.0%}" if f_rate is not None else "n/a"
+        s_rate_str = f"{s_rate:.0%}" if s_rate is not None else "n/a"
+        lines.append(
+            "\nTime split (first half = earliest entries, second half = most recent):"
+            f"\n  - First {len(first_half)}: {f_fav} favorable, {f_unfav} unfavorable, {f_neutral} neutral (win rate {f_rate_str})"
+            f"\n  - Latest {len(second_half)}: {s_fav} favorable, {s_unfav} unfavorable, {s_neutral} neutral (win rate {s_rate_str})"
+        )
+
+    # Specific high-regret spotlight — top 3 by |diff_percent|. Concrete,
+    # nameable, hard to abstract away. Each line gives the model enough
+    # context (ticker, date, scenario, magnitude) to write a specific
+    # observation around it.
+    regret_items = [it for it in items if it.current and it.current.diff_percent is not None]
+    if regret_items:
+        regret_items_sorted = sorted(
+            regret_items, key=lambda it: abs(it.current.diff_percent), reverse=True
+        )[:3]
+        lines.append("\nTop 3 decisions by absolute price change (regret spotlight):")
+        for rank, it in enumerate(regret_items_sorted, 1):
+            emo = it.emotion.value if it.emotion else "no emotion logged"
+            outcome = it.outcome.value if it.outcome else "no outcome"
+            direction = it.direction.value if it.direction else "no direction"
+            lines.append(
+                f"  - #{rank} {it.ticker} {it.scenario_type.value} on {it.decision_date.isoformat()}: "
+                f"{it.current.diff_percent:+.2f}% since ({direction}, {outcome}, felt {emo})"
+            )
 
     # Average diff_percent — give LLM a single-number magnitude sense
     diffs = [it.current.diff_percent for it in items if it.current]
