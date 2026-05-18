@@ -2,9 +2,12 @@
 
 Calculates peak distances, consistency score, and regret rankings.
 """
+import logging
 import statistics
 from datetime import datetime, timezone
 from typing import Optional
+
+from cachetools import TTLCache
 
 from schemas.patterns import (
     InsightsLocked,
@@ -17,7 +20,16 @@ from schemas.patterns import (
     RegrettedDecision,
 )
 from services.decision_service import get_user_decisions
+from services.llm_service import generate_insights
 from services.yfinance_service import get_price_series
+
+logger = logging.getLogger(__name__)
+
+# Per-user insights cache. Sonnet 4.6 is the most expensive call in the app,
+# so we cache aggressively. TTL chosen so a user adding a decision sees fresh
+# insights within an hour without forcing a regen on every dashboard render.
+_INSIGHTS_TTL_SECONDS = 60 * 60  # 1 hour
+_insights_cache: TTLCache = TTLCache(maxsize=1024, ttl=_INSIGHTS_TTL_SECONDS)
 
 
 def analyze_patterns(user_id: str) -> PatternsResponse:
@@ -87,24 +99,50 @@ def analyze_patterns(user_id: str) -> PatternsResponse:
 
 
 def get_patterns_insights(user_id: str) -> InsightsResponse:
-    """Generate F-06 AI insights summary or locked status."""
+    """Generate F-06 AI insights summary or locked status.
+
+    Flow:
+      1. < 10 decisions -> locked
+      2. Cache hit on user_id -> return cached insights (cached=True)
+      3. Cache miss -> LLM call via llm_service.generate_insights, store on
+         success, return (cached=False). On guardrail failure return
+         (degraded=True, insights=[]) without caching the empty result.
+    """
     res = get_user_decisions(user_id)
     items = res.items
 
     if len(items) < 10:
         return InsightsLocked(unlocked=False)
 
-    # Scaffolded AI insights for MVP
-    mock_insights = [
-        "You tend to experience hesitation when high-conviction growth stocks undergo rapid short-term surges.",
-        "Your decision consistency is notably stable during broader market pullbacks.",
-        "A recurring theme in your history is cutting successful positions short prematurely.",
-    ]
+    cached_entry = _insights_cache.get(user_id)
+    if cached_entry is not None:
+        cached_insights, cached_at = cached_entry
+        return InsightsUnlocked(
+            unlocked=True,
+            insights=cached_insights,
+            generated_at=cached_at,
+            cached=True,
+            degraded=False,
+        )
+
+    result = generate_insights(items)
+    generated_at = datetime.now(timezone.utc)
+
+    if not result.degraded:
+        _insights_cache[user_id] = (result.insights, generated_at)
+    else:
+        logger.warning("Insights generation degraded for user %s", user_id)
 
     return InsightsUnlocked(
         unlocked=True,
-        insights=mock_insights,
-        generated_at=datetime.now(timezone.utc),
-        cached=True,
-        degraded=False,
+        insights=result.insights,
+        generated_at=generated_at,
+        cached=False,
+        degraded=result.degraded,
     )
+
+
+def invalidate_insights_cache(user_id: str) -> None:
+    """Drop any cached insights for the user. Call after a new decision so
+    the next dashboard load regenerates against the updated history."""
+    _insights_cache.pop(user_id, None)

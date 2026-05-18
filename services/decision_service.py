@@ -96,6 +96,13 @@ def save_decision(user_id: str, input_data: DecisionInput) -> Decision:
             detail={"error": {"code": "DATABASE_ERROR", "message": "Failed to insert decision."}},
         )
 
+    # New decision changes the aggregate stats — drop any cached insights so
+    # the next /patterns/insights call regenerates against the fresh history.
+    # Imported lazily to avoid the pattern_service -> llm_service ->
+    # decision_service triangle becoming a hard cycle at import time.
+    from services.pattern_service import invalidate_insights_cache
+    invalidate_insights_cache(user_id)
+
     return Decision.model_validate(res.data[0])
 
 
