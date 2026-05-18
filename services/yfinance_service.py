@@ -104,3 +104,20 @@ def get_market_data(ticker: str, decision_date: date) -> MarketData:
         current_price=current_price,
         current_date=current_date,
     )
+
+
+def get_price_series(ticker: str, start_date: date, end_date: date) -> list[float]:
+    """Fetch all daily adjusted close prices within [start_date, end_date]."""
+    tk = yf.Ticker(ticker)
+    end_calc = end_date + timedelta(days=1)
+    try:
+        hist = tk.history(
+            start=start_date.strftime("%Y-%m-%d"),
+            end=end_calc.strftime("%Y-%m-%d"),
+            auto_adjust=True,
+        )
+        if hist.empty:
+            return []
+        return [float(x) for x in hist["Close"]]
+    except Exception:
+        return []
