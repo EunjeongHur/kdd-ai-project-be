@@ -27,6 +27,15 @@ class ExtractedFields(BaseModel):
     decision_date: Optional[date] = None
     quantity: Optional[float] = None
     amount: Optional[float] = None
+    title: Optional[str] = Field(
+        None,
+        description=(
+            "Short event-style label generated from the decision context "
+            "(3-7 words, Title Case, e.g., 'NVDA Earnings Dip Skipped'). "
+            "Used by the reflections list page. Null when input lacks "
+            "enough context to summarize."
+        ),
+    )
 
 
 class ConfidenceScores(BaseModel):
@@ -39,6 +48,7 @@ class ConfidenceScores(BaseModel):
     decision_date: float = Field(0.0, ge=0, le=1)
     quantity: float = Field(0.0, ge=0, le=1)
     amount: float = Field(0.0, ge=0, le=1)
+    title: float = Field(0.0, ge=0, le=1)
 
 
 class ParseDecisionResponse(BaseModel):

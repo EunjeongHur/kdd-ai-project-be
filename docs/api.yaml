@@ -574,6 +574,12 @@ components:
             amount:
               type: number
               nullable: true
+            title:
+              type: string
+              nullable: true
+              description: |
+                Short event-style headline (3-7 words, Title Case) generated from the decision
+                context. Used by the reflections list page. Null when input is too sparse.
         confidence:
           type: object
           description: Per-field confidence (0-1). Frontend should clear fields below 0.7.
@@ -583,6 +589,7 @@ components:
             decision_date: { type: number, minimum: 0, maximum: 1 }
             quantity: { type: number, minimum: 0, maximum: 1 }
             amount: { type: number, minimum: 0, maximum: 1 }
+            title: { type: number, minimum: 0, maximum: 1 }
         ticker_validated:
           type: boolean
           description: Whether the extracted ticker passed `/tickers/validate`.
