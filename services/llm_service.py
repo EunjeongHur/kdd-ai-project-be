@@ -88,12 +88,22 @@ If a relative phrase resolves to a future date, choose the most recent matching 
 - If user gives BOTH share count AND per-share price (e.g., "10 shares at $250"), set quantity=10 AND amount = 10 * 250 = 2500. Both fields populated represents the actual transaction value.
 - Null if the user only mentioned share count or no size at all.
 
+### title
+- Short event-style label (3-7 words, Title Case) used as the reflection's headline in journal lists.
+- Should evoke the SITUATION or EVENT around the decision, not restate enums.
+  - GOOD: "NVDA Earnings Dip Skipped", "TSLA Profit-Take Regret", "AAPL September Hold"
+  - BAD:  "No Buy of NVDA", "User did not sell" (just restating scenario_type)
+- Pull concrete context the user mentioned: catalyst (earnings, dip, rally), timing (March, last week), or outcome framing (skipped, held, sold early).
+- No emoji, no em-dash, no AI buzzwords (no "AI", "smart", "intelligent").
+- Set to null when the input is too sparse for a meaningful headline (e.g., "bought NVDA"). Don't pad with generic words.
+
 ### confidence
 Per-field self-assessment in [0, 1]:
 - 1.0 — explicit and unambiguous in input
 - 0.7-0.9 — strong inference (e.g., "Nvidia" → NVDA, "late March" → March 25)
 - 0.4-0.6 — weak inference (ambiguous date, unclear scenario)
 - 0.0 — field not mentioned (value is null)
+- For `title`: 0.9+ when input has clear catalyst/timing/outcome; 0.7-0.8 when somewhat thin; 0.0 when null.
 
 ### reasoning
 1-2 sentences explaining how each non-null field was derived. Mention any ambiguity.
@@ -115,8 +125,9 @@ extract_decision:
   decision_date: "2026-03-25"
   quantity: 10
   amount: null
-  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 0.8, quantity: 1.0, amount: 0.0 }
-  reasoning: "User considered buying Nvidia (NVDA) but did not — no_buy. 'Late March' resolves to March 25, current year (most recent past March)."
+  title: "NVDA March Entry Skipped"
+  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 0.8, quantity: 1.0, amount: 0.0, title: 0.9 }
+  reasoning: "User considered buying Nvidia (NVDA) but did not — no_buy. 'Late March' resolves to March 25, current year (most recent past March). Title captures ticker + timing + skipped entry."
 
 Input: "지난주 테슬라 100주 $250에 팔았는데, 지금 보니 너무 일찍 팔았네."
 Today: 2026-05-10
@@ -126,8 +137,9 @@ extract_decision:
   decision_date: "2026-05-03"
   quantity: 100
   amount: 25000
-  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 0.8, quantity: 1.0, amount: 0.95 }
-  reasoning: "User sold Tesla (TSLA) and price rose afterward — sold_too_early. 'Last week' = today - 7. $250 is per-share, multiplied by 100 shares = $25000 total amount."
+  title: "TSLA Early Exit Regret"
+  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 0.8, quantity: 1.0, amount: 0.95, title: 0.9 }
+  reasoning: "User sold Tesla (TSLA) and price rose afterward — sold_too_early. 'Last week' = today - 7. $250 is per-share, multiplied by 100 shares = $25000 total amount. Title reflects early-exit framing."
 
 Input: "Held onto Apple through the September dip — should've sold at $220."
 Today: 2026-05-10
@@ -137,8 +149,9 @@ extract_decision:
   decision_date: "2025-09-15"
   quantity: null
   amount: null
-  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 0.7, quantity: 0.0, amount: 0.0 }
-  reasoning: "User held Apple (AAPL) and considered selling — no_sell. 'September' alone resolves to mid-month, last year (most recent past September)."
+  title: "AAPL September Dip Hold"
+  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 0.7, quantity: 0.0, amount: 0.0, title: 0.9 }
+  reasoning: "User held Apple (AAPL) and considered selling — no_sell. 'September' alone resolves to mid-month, last year (most recent past September). Title captures the dip catalyst plus hold action."
 
 Input: "어제 마이크로소프트에 5천 달러 정도 넣을까 했어."
 Today: 2026-05-10
@@ -148,8 +161,9 @@ extract_decision:
   decision_date: "2026-05-09"
   quantity: null
   amount: 5000
-  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 1.0, quantity: 0.0, amount: 0.95 }
-  reasoning: "User considered buying Microsoft (MSFT) — no_buy. '어제' = today - 1 day. '5천 달러' = $5000."
+  title: "MSFT $5K Entry Hesitation"
+  confidence: { ticker: 1.0, scenario_type: 1.0, decision_date: 1.0, quantity: 0.0, amount: 0.95, title: 0.85 }
+  reasoning: "User considered buying Microsoft (MSFT) — no_buy. '어제' = today - 1 day. '5천 달러' = $5000. Title captures hesitation around a specific dollar amount."
 
 Input: "tech stocks 좀 살까 했는데 안 샀어."
 Today: 2026-05-10
@@ -159,8 +173,9 @@ extract_decision:
   decision_date: null
   quantity: null
   amount: null
-  confidence: { ticker: 0.0, scenario_type: 0.9, decision_date: 0.0, quantity: 0.0, amount: 0.0 }
-  reasoning: "User considered buying — no_buy. 'tech stocks' is a sector, not a specific ticker; cannot extract. No date or size mentioned."
+  title: null
+  confidence: { ticker: 0.0, scenario_type: 0.9, decision_date: 0.0, quantity: 0.0, amount: 0.0, title: 0.0 }
+  reasoning: "User considered buying — no_buy. 'tech stocks' is a sector, not a specific ticker; cannot extract. No date or size mentioned. Title null because no concrete catalyst/ticker to anchor the headline."
 """
 
 
@@ -197,6 +212,14 @@ EXTRACT_TOOL: dict[str, Any] = {
                 "type": ["number", "null"],
                 "description": "Total USD amount. Null if not mentioned. Set both this and quantity for actual transactions.",
             },
+            "title": {
+                "type": ["string", "null"],
+                "description": (
+                    "Short event-style label (3-7 words, Title Case) used as the "
+                    "reflection's headline. Pull catalyst/timing/outcome framing "
+                    "from the input. Null if input is too sparse for a meaningful title."
+                ),
+            },
             "confidence": {
                 "type": "object",
                 "description": "Per-field self-rated confidence in [0, 1]. Use 0 for null fields.",
@@ -206,6 +229,7 @@ EXTRACT_TOOL: dict[str, Any] = {
                     "decision_date": {"type": "number", "minimum": 0, "maximum": 1},
                     "quantity": {"type": "number", "minimum": 0, "maximum": 1},
                     "amount": {"type": "number", "minimum": 0, "maximum": 1},
+                    "title": {"type": "number", "minimum": 0, "maximum": 1},
                 },
                 "required": [
                     "ticker",
@@ -213,6 +237,7 @@ EXTRACT_TOOL: dict[str, Any] = {
                     "decision_date",
                     "quantity",
                     "amount",
+                    "title",
                 ],
             },
             "reasoning": {
@@ -226,6 +251,7 @@ EXTRACT_TOOL: dict[str, Any] = {
             "decision_date",
             "quantity",
             "amount",
+            "title",
             "confidence",
             "reasoning",
         ],
@@ -348,6 +374,7 @@ def parse_decision_text(text: str) -> ParseDecisionResponse:
             decision_date=raw.get("decision_date"),
             quantity=raw.get("quantity"),
             amount=raw.get("amount"),
+            title=raw.get("title"),
         )
         confidence = ConfidenceScores(**(raw.get("confidence") or {}))
     except Exception as exc:

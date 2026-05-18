@@ -1,11 +1,27 @@
 """Pydantic models for /decisions. Matches docs/api.yaml."""
 from datetime import date, datetime
+from enum import Enum
 from uuid import UUID
 from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator, ConfigDict
 
 from schemas.calculate import CalculateResponse, DecisionPriceSource, Direction, Outcome, ScenarioType
+
+
+class EmotionType(str, Enum):
+    """User's self-reported emotion at the time the decision was made.
+
+    Captured via a 7-option picker on the new-reflection form. Kept structured
+    (rather than free-text) so pattern analysis can aggregate consistently.
+    """
+    CONFIDENT = "confident"
+    OPTIMISTIC = "optimistic"
+    NEUTRAL = "neutral"
+    CAUTIOUS = "cautious"
+    ANXIOUS = "anxious"
+    FEARFUL = "fearful"
+    GREEDY = "greedy"
 
 
 class DecisionInput(BaseModel):
@@ -17,6 +33,18 @@ class DecisionInput(BaseModel):
     quantity: Optional[float] = Field(None, gt=0, description="Shares considered.")
     amount: Optional[float] = Field(None, gt=0, description="USD amount considered.")
     notes: Optional[str] = Field(None, max_length=500, description="User notes.")
+    title: Optional[str] = Field(
+        None,
+        max_length=120,
+        description=(
+            "Short event-style headline (3-7 words). Frontend either pulls from "
+            "/parse-decision or accepts a manual override. Null when blank."
+        ),
+    )
+    emotion: Optional[EmotionType] = Field(
+        None,
+        description="User's emotion at decision time. Null when not selected.",
+    )
 
     @model_validator(mode="after")
     def check_quantity_or_amount(self) -> "DecisionInput":
@@ -25,6 +53,20 @@ class DecisionInput(BaseModel):
         if self.end_date and self.end_date < self.decision_date:
             raise ValueError("end_date cannot be before decision_date.")
         return self
+
+
+class DecisionReflectionPatch(BaseModel):
+    """Body for PATCH /decisions/{id}. Currently only reflection text is patchable.
+
+    Used by the frontend after POST /decisions + POST /reflect: once we have the
+    LLM-generated narrative we attach it to the saved decision so list/detail
+    views can display it. Pass null to clear an existing reflection.
+    """
+    reflection: Optional[str] = Field(
+        None,
+        max_length=2000,
+        description="Narrative reflection text (1-2 sentences) from /reflect.",
+    )
 
 
 class Decision(BaseModel):
@@ -42,6 +84,8 @@ class Decision(BaseModel):
     amount: Optional[float] = None
     decision_price_snapshot: float
     notes: Optional[str] = None
+    title: Optional[str] = None
+    emotion: Optional[EmotionType] = None
     created_at: datetime
     updated_at: datetime
 
