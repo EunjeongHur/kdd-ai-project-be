@@ -1,6 +1,6 @@
 """If-Vest API entry point.
 
-Minimal FastAPI app. Only /health is implemented.
+Minimal FastAPI app.
 See docs/api.yaml for the full contract.
 """
 from typing import Optional
@@ -20,6 +20,9 @@ from routers.parse_decision import router as parse_decision_router
 from routers.reflect import router as reflect_router
 from routers.tickers import router as tickers_router
 from routers.price_history import router as price_history_router
+from routers.decisions import router as decisions_router
+from routers.patterns import router as patterns_router
+from routers.admin import router as admin_router
 
 
 APP_VERSION = "0.2.0"
@@ -95,6 +98,9 @@ app.include_router(parse_decision_router)
 app.include_router(reflect_router)
 app.include_router(tickers_router)
 app.include_router(price_history_router)
+app.include_router(decisions_router)
+app.include_router(patterns_router)
+app.include_router(admin_router)
 
 class HealthResponse(BaseModel):
     status: str
