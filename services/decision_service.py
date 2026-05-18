@@ -70,6 +70,8 @@ def save_decision(user_id: str, input_data: DecisionInput) -> Decision:
         "amount": float(input_data.amount) if input_data.amount is not None else None,
         "decision_price_snapshot": round(decision_price, 4),
         "notes": input_data.notes,
+        "title": input_data.title,
+        "emotion": input_data.emotion.value if input_data.emotion else None,
         "current_price": round(market.current_price, 4),
         "diff_amount": round(diff_amount, 2),
         "diff_percent": round(diff_percent, 2),
@@ -183,6 +185,37 @@ def get_user_decisions(
 
     total_count = res.count if res.count is not None else len(items)
     return DecisionListResponse(items=items, total=total_count)
+
+
+def update_decision_reflection(
+    user_id: str,
+    decision_id: UUID,
+    reflection: Optional[str],
+) -> Decision:
+    """Attach (or clear) a reflection text on a saved decision.
+
+    Used by PATCH /decisions/{id} so the frontend can write the LLM-generated
+    narrative back onto the row that POST /decisions just created.
+    """
+    client = get_supabase()
+    res = (
+        client.table("decisions")
+        .update({"reflection": reflection})
+        .eq("id", str(decision_id))
+        .eq("user_id", user_id)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": {
+                    "code": "DECISION_NOT_FOUND",
+                    "message": "Decision not found or unauthorized.",
+                }
+            },
+        )
+    return Decision.model_validate(res.data[0])
 
 
 def delete_decision(user_id: str, decision_id: UUID) -> None:

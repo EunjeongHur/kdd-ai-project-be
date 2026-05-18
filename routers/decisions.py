@@ -5,9 +5,19 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
-from schemas.decisions import Decision, DecisionInput, DecisionListResponse
+from schemas.decisions import (
+    Decision,
+    DecisionInput,
+    DecisionListResponse,
+    DecisionReflectionPatch,
+)
 from services.auth_service import get_current_user
-from services.decision_service import delete_decision, get_user_decisions, save_decision
+from services.decision_service import (
+    delete_decision,
+    get_user_decisions,
+    save_decision,
+    update_decision_reflection,
+)
 
 router = APIRouter(prefix="/decisions", tags=["decisions"])
 
@@ -32,6 +42,16 @@ def list_decisions(
 ) -> DecisionListResponse:
     """List current user decisions with real-time recalculated opportunity costs."""
     return get_user_decisions(user_id, ticker, scenario_type, from_date, to_date, sort)
+
+
+@router.patch("/{decision_id}", response_model=Decision)
+def patch_decision(
+    decision_id: UUID,
+    body: DecisionReflectionPatch,
+    user_id: str = Depends(get_current_user),
+) -> Decision:
+    """Attach (or clear) a reflection text on a saved decision."""
+    return update_decision_reflection(user_id, decision_id, body.reflection)
 
 
 @router.delete("/{decision_id}", status_code=status.HTTP_204_NO_CONTENT)

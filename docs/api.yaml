@@ -354,9 +354,44 @@ components:
           type: string
           maxLength: 500
           nullable: true
+        title:
+          type: string
+          maxLength: 120
+          nullable: true
+          description: |
+            Short event-style headline (3-7 words) for this reflection. Pulled from
+            /parse-decision by default, or manually entered by the user.
+        emotion:
+          allOf: [{ $ref: "#/components/schemas/EmotionType" }]
+          nullable: true
+          description: User's emotion at decision time (selected from a fixed picker).
       anyOf:
         - required: [quantity]
         - required: [amount]
+
+    EmotionType:
+      type: string
+      description: User's self-reported emotion at decision time.
+      enum:
+        - confident
+        - optimistic
+        - neutral
+        - cautious
+        - anxious
+        - fearful
+        - greedy
+
+    DecisionReflectionPatch:
+      type: object
+      description: |
+        Body for `PATCH /decisions/{id}`. Currently only `reflection` is patchable —
+        used by the frontend after `POST /decisions` + `POST /reflect` to attach
+        the LLM-generated narrative onto the saved row.
+      properties:
+        reflection:
+          type: string
+          maxLength: 2000
+          nullable: true
 
     Decision:
       type: object
@@ -399,6 +434,18 @@ components:
         notes:
           type: string
           nullable: true
+        title:
+          type: string
+          nullable: true
+        emotion:
+          allOf: [{ $ref: "#/components/schemas/EmotionType" }]
+          nullable: true
+        reflection:
+          type: string
+          nullable: true
+          description: |
+            LLM-generated narrative attached via `PATCH /decisions/{id}`. Null until
+            the frontend has called `/reflect` and patched it back.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
       anyOf:
@@ -970,6 +1017,29 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "502": { $ref: "#/components/responses/UpstreamError" }
+    patch:
+      tags: [decisions]
+      summary: Attach (or clear) reflection text on a saved decision
+      description: |
+        Currently only `reflection` is patchable. Used after the frontend calls
+        `POST /reflect` to write the LLM-generated narrative onto the row that
+        `POST /decisions` just created. Pass `reflection: null` to clear.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DecisionReflectionPatch" }
+      responses:
+        "200":
+          description: Updated Decision row.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Decision" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
     delete:
       tags: [decisions]
       summary: Delete a decision
