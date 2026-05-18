@@ -44,7 +44,7 @@ app.add_middleware(
     # The scope segment is verified once we have a real preview URL; update if wrong.
     allow_origin_regex=r"https://if-vest-.+-eunjeonghur\.vercel\.app",
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Admin-Token"],
 )
 
