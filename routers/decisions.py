@@ -10,10 +10,12 @@ from schemas.decisions import (
     DecisionInput,
     DecisionListResponse,
     DecisionReflectionPatch,
+    DecisionWithCurrent,
 )
 from services.auth_service import get_current_user
 from services.decision_service import (
     delete_decision,
+    get_decision_by_id,
     get_user_decisions,
     save_decision,
     update_decision_reflection,
@@ -42,6 +44,15 @@ def list_decisions(
 ) -> DecisionListResponse:
     """List current user decisions with real-time recalculated opportunity costs."""
     return get_user_decisions(user_id, ticker, scenario_type, from_date, to_date, sort)
+
+
+@router.get("/{decision_id}", response_model=DecisionWithCurrent)
+def get_decision(
+    decision_id: UUID,
+    user_id: str = Depends(get_current_user),
+) -> DecisionWithCurrent:
+    """Fetch a single decision with freshly-recomputed current values."""
+    return get_decision_by_id(user_id, decision_id)
 
 
 @router.patch("/{decision_id}", response_model=Decision)
