@@ -1,12 +1,12 @@
 """If-Vest API entry point.
 
 Minimal FastAPI app.
-See docs/api.yaml for the full contract.
+See docs/api.yaml for the full backend contract.
 """
 from typing import Optional
 
 from dotenv import load_dotenv  # Load .env BEFORE any module that reads env vars
-load_dotenv()
+load_dotenv(override=True)
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
