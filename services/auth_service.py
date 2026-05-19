@@ -12,7 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 security = HTTPBearer(auto_error=False)
 
 # Default test UUID (must exist in profiles table for foreign key constraint)
-DEFAULT_TEST_USER_ID = "69416410-ddda-431d-816b-e5a64d1a1e7e"
+DEFAULT_TEST_USER_ID = os.getenv("TEST_USER_ID") or "69416410-ddda-431d-816b-e5a64d1a1e7e"
 
 
 def get_current_user(
