@@ -8,6 +8,7 @@ in development/test environments. Production deploys must set ENV=production
 (or omit it entirely — production is the default for safety) and provide
 real SUPABASE_JWT_SECRET / ADMIN_TOKEN values.
 """
+import base64
 import os
 import jwt
 from typing import Optional
@@ -49,9 +50,18 @@ def get_current_user(
         try:
             secret = os.getenv("SUPABASE_JWT_SECRET")
             if secret:
+                # Supabase JWT secrets are base64-encoded strings.
+                # PyJWT requires the raw decoded bytes for HMAC verification.
+                try:
+                    # Add padding if missing to prevent b64decode from failing
+                    padded_secret = secret + "=" * (-len(secret) % 4)
+                    secret_key = base64.b64decode(padded_secret)
+                except Exception:
+                    secret_key = secret  # Fallback if it's not base64
+
                 payload = jwt.decode(
                     token,
-                    secret,
+                    secret_key,
                     algorithms=["HS256"],
                     audience="authenticated",
                 )
