@@ -78,7 +78,7 @@ class Decision(BaseModel):
     ticker: str
     scenario_type: ScenarioType
     decision_date: date
-    actual_date_used: date
+    actual_date_used: Optional[date] = None
     end_date: Optional[date] = None
     quantity: Optional[float] = None
     amount: Optional[float] = None
